@@ -1,7 +1,7 @@
-from openai import OpenAI, api_key
+from openai import OpenAI
+import numpy as np
 from dotenv import load_dotenv
 import os
-
 load_dotenv()
 
 client = OpenAI(
@@ -16,5 +16,5 @@ completion = client.chat.completions.create(
             "role": "user",
             "content": "Write a haiku about recursion in programming."
         }
-    ]
+    ],
 )
