@@ -4,7 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment="test">
+    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment=".env remove?">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -88,7 +88,7 @@
       <workItem from="1732393668798" duration="9000" />
       <workItem from="1732393824531" duration="5000" />
       <workItem from="1733168375232" duration="1219000" />
-      <workItem from="1733175787180" duration="747000" />
+      <workItem from="1733175787180" duration="1824000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />
@@ -114,7 +114,15 @@
       <option name="project" value="LOCAL" />
       <updated>1732327314331</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary=".env remove?">
+      <option name="closed" value="true" />
+      <created>1733177061266</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1733177061266</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -122,6 +130,7 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="test" />
-    <option name="LAST_COMMIT_MESSAGE" value="test" />
+    <MESSAGE value=".env remove?" />
+    <option name="LAST_COMMIT_MESSAGE" value=".env remove?" />
   </component>
 </project>
