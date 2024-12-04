@@ -19,7 +19,3 @@ def convert_pdfs_to_text(pdf_dir, text_dir):
                 f.write(text)
             print(f"Converted {pdf_file} to text.")
 
-x=1
-p_path = os.getenv("PDF_PATH")
-
-wow = pdf_to_text(p_path)

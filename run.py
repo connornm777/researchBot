@@ -1,12 +1,14 @@
 from openai import OpenAI
 import numpy as np
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 import os
 import utils as gt
-load_dotenv()
+env_vars = dotenv_values()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+class test:
+    def __init__(self):
+        for key, value in dotenv_values().items():
+            setattr(self, key, value)
 
 
 
