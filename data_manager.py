@@ -332,7 +332,7 @@ Text:
                         value = value.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
                         # Add the field to the BibTeX entry
                         bib_entry += f"  {key} = {{{value}}},\n"
-                    bib_entry += "}}\n\n"
+                    bib_entry += "}\n\n"
 
                     f.write(bib_entry)
             print(f"Generated {self.REF_PATH} using references data.")

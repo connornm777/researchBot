@@ -4,11 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment="joe mama">
-      <change afterPath="$PROJECT_DIR$/search_app.py" afterDir="false" />
+    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment="Joe MAMA">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/data_manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/data_manager.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/run.py" beforeDir="false" afterPath="$PROJECT_DIR$/run.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -100,7 +98,7 @@
       <workItem from="1733168375232" duration="1219000" />
       <workItem from="1733175787180" duration="7370000" />
       <workItem from="1733249839367" duration="12217000" />
-      <workItem from="1733334424463" duration="20965000" />
+      <workItem from="1733334424463" duration="23831000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />
@@ -190,7 +188,15 @@
       <option name="project" value="LOCAL" />
       <updated>1733286173062</updated>
     </task>
-    <option name="localTasksCounter" value="12" />
+    <task id="LOCAL-00012" summary="Joe MAMA">
+      <option name="closed" value="true" />
+      <created>1733373247334</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1733373247334</updated>
+    </task>
+    <option name="localTasksCounter" value="13" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -200,6 +206,7 @@
     <MESSAGE value="test" />
     <MESSAGE value=".env remove?" />
     <MESSAGE value="joe mama" />
-    <option name="LAST_COMMIT_MESSAGE" value="joe mama" />
+    <MESSAGE value="Joe MAMA" />
+    <option name="LAST_COMMIT_MESSAGE" value="Joe MAMA" />
   </component>
 </project>
