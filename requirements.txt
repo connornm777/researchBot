@@ -1,0 +1,9 @@
+pyperclip
+PyQt5
+PyQtWebEngine
+python-dotenv
+openai
+tiktoken
+numpy
+pdfminer.six
+pypdf2
