@@ -72,8 +72,6 @@ class DataManager:
                     'text_filename': '',
                     'chunked': False,
                     'chunks': [],
-                    'embedded': False,
-                    'metadata_extracted': False,
                     'references': {},  # Open-ended sub-dictionary for reference info
                     'references_extracted': False,
                     # Other processing flags can be added as needed
@@ -92,7 +90,7 @@ class DataManager:
         Removes redundant author, title, and affiliations data not under the 'references'
         sub-dictionary in the metadata.
         """
-        fields_to_remove = ['title', 'authors', 'affiliations', 'embedded']
+        fields_to_remove = ['title', 'authors', 'affiliations', 'embedded', 'metadata_extracted']
         modified = False
 
         for pdf_filename, data in self.metadata.items():
@@ -222,10 +220,139 @@ class DataManager:
             except Exception as e:
                 print(f"Error chunking text for {pdf_filename}: {e}")
 
+    def remove_problematic_entries(self):
+        """
+        Identify and remove problematic entries from metadata and embeddings.
+        For example, entries with empty titles.
+        This function:
+        - Finds entries with empty (or invalid) titles.
+        - Asks the user to confirm deletion.
+        - Removes those entries and their associated embeddings from self.embeddings.
+        - Reindexes embedding indexes for all remaining entries.
+        """
+
+        # Identify problematic PDFs (for example, those with empty titles)
+        # You can adjust this condition as needed
+        problematic_pdfs = []
+        for pdf_filename, data in self.metadata.items():
+            references = data.get('references', {})
+            title = references.get('title', '').strip()
+            # Condition: empty title or no title field
+            if title == '':
+                problematic_pdfs.append(pdf_filename)
+
+        if not problematic_pdfs:
+            print("No problematic entries found (e.g., no empty titles).")
+            return
+
+        # Ask for confirmation to remove each problematic PDF
+        to_remove = []
+        for pdf_filename in problematic_pdfs:
+            answer = input(
+                f"Found problematic entry: {pdf_filename} has empty title. Remove it? (y/n): ").strip().lower()
+            if answer == 'y':
+                to_remove.append(pdf_filename)
+            else:
+                print(f"Skipping removal of {pdf_filename}.")
+
+        if not to_remove:
+            print("No entries selected for removal.")
+            return
+
+        # Gather all embeddings to remove
+        # We'll collect all embedding indexes from each PDF we're removing
+        embedding_indexes_to_remove = []
+        for pdf_filename in to_remove:
+            if self.metadata[pdf_filename]['converted_to_text']:
+                os.remove(os.path.join(self.TXT_PATH, self.metadata[pdf_filename]['text_filename']))
+            os.replace(os.path.join(self.PDF_PATH, pdf_filename), os.path.join(self.MAN_PATH, pdf_filename))
+            data = self.metadata[pdf_filename]
+            # Collect all embedding indexes from the chunks
+            chunks = data.get('chunks', [])
+            for chunk_meta in chunks:
+                idx = chunk_meta.get('embedding_index')
+                if idx is not None:
+                    embedding_indexes_to_remove.append(idx)
+
+        if not embedding_indexes_to_remove and not to_remove:
+            # Nothing to remove
+            print("No embeddings or entries to remove.")
+            return
+
+        # Sort embedding indexes to remove
+        embedding_indexes_to_remove.sort()
+
+        # Create a mask for embeddings we want to keep
+        old_count = len(self.embeddings)
+        keep_mask = np.ones(old_count, dtype=bool)
+        for idx in embedding_indexes_to_remove:
+            if 0 <= idx < old_count:
+                keep_mask[idx] = False
+
+        # Filter embeddings
+        new_embeddings = self.embeddings[keep_mask]
+
+        # Now we need to update embedding_index references in metadata
+        # Create a mapping from old indexes to new indexes
+        old_to_new = [None] * old_count
+        new_index = 0
+        for i in range(old_count):
+            if keep_mask[i]:
+                old_to_new[i] = new_index
+                new_index += 1
+
+        # Remove the PDFs from metadata and fix embedding indexes in remaining entries
+        for pdf_filename in to_remove:
+            del self.metadata[pdf_filename]
+
+        # Update all embedding indexes in remaining metadata
+        for pdf_filename, data in self.metadata.items():
+            chunks = data.get('chunks', [])
+            for chunk_meta in chunks:
+                idx = chunk_meta.get('embedding_index', None)
+                if idx is not None and idx < old_count:
+                    new_idx = old_to_new[idx]
+                    # If this embedding was removed, new_idx would be None, but that
+                    # should not happen for chunks we keep. Just in case:
+                    if new_idx is None:
+                        # This chunk lost its embedding, handle as needed or set to None
+                        chunk_meta['embedding_index'] = None
+                    else:
+                        chunk_meta['embedding_index'] = new_idx
+
+        # Assign updated embeddings back to self.embeddings
+        self.embeddings = new_embeddings
+        self.save_embeddings()
+        self.save_metadata()
+        print("Removed selected entries and reorganized embeddings and metadata indexes.")
+
+    def clear_references(self):
+        """
+        Clears old references from the metadata, resets the 'references_extracted' flag,
+        and optionally removes the existing references.bib file.
+        """
+        # Iterate over all PDFs in the metadata
+        for pdf_filename, data in self.metadata.items():
+            # Clear references
+            data['references'] = {}
+            # Reset the flag so that extract_references can run again
+            data['references_extracted'] = False
+
+        # Save updated metadata
+        self.save_metadata()
+        print("Cleared old references in metadata and reset 'references_extracted' flags.")
+
+        # Optionally remove the existing references.bib file if you want a fresh start
+        # Comment this out if you prefer to keep the old file
+        if os.path.exists(self.REF_PATH):
+            os.remove(self.REF_PATH)
+            print(f"Removed old {self.REF_PATH} file.")
+
     def extract_references(self):
         """
         Uses GPT to extract reference information from the first chunk
         of each text file, and updates the metadata under the 'references' field.
+        Also requests the model to provide a suitable citation key and item type.
         """
         for pdf_filename, data in self.metadata.items():
             if not data.get('chunked'):
@@ -245,36 +372,74 @@ class DataManager:
                     first_chunk_text = f.read()
 
                 # Prepare the prompt for GPT
+                # We now ask for 'citation_key' and 'type' fields as well.
                 prompt = f"""
-Extract any reference information from the text below. Possible fields include, but are not limited to:
+    Extract bibliographic information from the text below and return it as a JSON object that can be directly converted into a valid BibTeX entry.
 
-- Title of the paper
-- Authors
-- Affiliations
-- Journal
-- Year
-- Volume
-- Issue
-- Pages
-- DOI
-- URL
+    Fields to use if present:
+    - title
+    - author (as a list of strings, each "FirstName LastName")
+    - journal
+    - year
+    - volume
+    - number
+    - pages
+    - publisher
+    - address
+    - note
+    - doi
+    - url
 
-If any information is missing, simply omit that field.
+    If an author uses an equation in the title, make sure you use $ to enclose it so it compiles in latex.
 
-Return the information in JSON format.
+    All values must be strings. If a field is unknown, omit it. Don't write 'none' or 'not specified'. Do not include any fields not listed above.
 
-Text:
-\"\"\"
-{first_chunk_text}
-\"\"\"
-"""
+    Additionally, determine the appropriate BibTeX item type:
+    - If 'journal' is present, use "article".
+    - If 'publisher' and 'address' are present and no 'journal', use "book".
+    - Otherwise, use "misc".
+
+    Return a 'type' field indicating the chosen item type.
+
+    Also, generate a 'citation_key' field that is:
+    - all lowercase
+    - no special characters or spaces
+    - as short as possible but still unique
+    - derive it from the first author's last name (if available), the year (if available), and a distinctive short portion of the title (if available)
+    - If any of these are missing, just do your best to create a short stable key.
+
+    Return only these fields and do not include commentary or additional text outside the JSON.
+
+    Example JSON:
+    {{
+      "type": "article",
+      "citation_key": "hallwightman1957",
+      "title": "A Theorem on Invariant Analytic Functions with Applications to Relativistic Quantum Field Theory",
+      "author": ["D. Hall", "A. S. Wightman"],
+      "journal": "Matematisk-fysiske Meddelelser",
+      "volume": "31",
+      "number": "5",
+      "year": "1957",
+      "publisher": "Det Kongelige Danske Videnskabernes Selskab",
+      "address": "Copenhagen",
+      "note": "In commission at Ejnar Munksgaard"
+    }}
+
+    If a field is numeric, convert it to a string. Authors must be strings in a list. If multiple authors, separate them into multiple items. The JSON must be strictly parseable with Python's json.loads().
+
+    Text:
+    \"\"\"
+    {first_chunk_text}
+    \"\"\"
+    """
 
                 # Call the OpenAI API
                 response = openai.chat.completions.create(
                     model=self.PARSE_MODEL,
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": "You are a helpful assistant that extracts reference information from academic papers."},
+                        {"role": "system",
+                         "content": "You are a helpful assistant that extracts reference information from academic papers."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0
@@ -307,30 +472,37 @@ Text:
                     if not references:
                         continue  # Skip if no references data
 
-                    # Use the PDF filename without extension as the citation key
-                    citation_key = os.path.splitext(pdf_filename)[0]
+                    # Use provided 'type' field; default to "misc" if not present
+                    entry_type = references.get('type', 'misc')
 
-                    # Build the BibTeX entry dynamically based on available fields
-                    bib_entry = f"@article{{{citation_key},\n"
+                    # Use provided 'citation_key' field; if missing, generate a fallback from pdf_filename
+                    citation_key = references.get('citation_key')
+                    if not citation_key or not isinstance(citation_key, str) or citation_key.strip() == '':
+                        # Fallback: all lowercase, remove special chars
+                        base_key = os.path.splitext(pdf_filename)[0]
+                        base_key = ''.join(ch for ch in base_key.lower() if ch.isalnum())
+                        citation_key = base_key if base_key else 'unknownkey'
+
+                    bib_entry = f"@{entry_type}{{{citation_key},\n"
                     for key, value in references.items():
-                        # Convert key to string if it's not already
-                        if not isinstance(key, str):
-                            key = str(key)
-                        # Skip keys with empty or None values
+                        # Skip 'type' and 'citation_key' fields as they are not BibTeX fields
+                        if key in ['type', 'citation_key']:
+                            continue
+
                         if value is None or value == '':
                             continue
                         # Convert value to string if it's not already
                         if isinstance(value, list):
                             # Convert all elements in the list to strings
                             value = [str(item) for item in value]
-                            # Join list elements using ' and ' as per BibTeX format for multiple authors
+                            # Join list elements using ' and '
                             value = ' and '.join(value)
                         else:
-                            # Convert value to string
                             value = str(value)
+
                         # Escape special characters in value
                         value = value.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
-                        # Add the field to the BibTeX entry
+
                         bib_entry += f"  {key} = {{{value}}},\n"
                     bib_entry += "}\n\n"
 
@@ -466,3 +638,7 @@ Text:
 
 if __name__ == "__main__":
     dm = DataManager()
+    dm.update_metadata()
+    dm.process_pdfs()
+    dm.chunk_text_files()
+    dm.process_embeddings()
