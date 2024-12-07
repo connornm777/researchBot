@@ -6,8 +6,8 @@ import time
 import re
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QPushButton, QLabel, QFrame, QDialog,
-                             QDialogButtonBox, QFileDialog, QScrollArea, QWidget, QSizePolicy)
-from PyQt5.QtGui import QFont, QTextCursor, QKeyEvent
+                             QDialogButtonBox, QFileDialog, QScrollArea, QWidget, QSizePolicy, QShortcut)
+from PyQt5.QtGui import QFont, QTextCursor, QKeyEvent, QKeySequence
 from PyQt5.QtCore import Qt
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from dotenv import load_dotenv
@@ -108,7 +108,10 @@ class ReferenceChatGUI(QWidget):
         self.html_messages = []
         self.typing_indicator_visible = False
 
+        # Keep track of all snippets found so far
         self.indexed_snippets = []
+        # A cache for snippet stability: key=(pdf_filename, snippet), value=snippet_id
+        self.snippet_cache = {}
         self.displayed_equations = []
 
         # Original send button stylesheet
@@ -121,7 +124,7 @@ class ReferenceChatGUI(QWidget):
     def init_ui(self):
         self.setWindowTitle("GPT Reference Assistant")
 
-        # Dark mode stylesheet with scrollbar theming
+        # Dark mode stylesheet
         self.setStyleSheet("""
         QWidget {
             background-color: #202020;
@@ -178,7 +181,6 @@ class ReferenceChatGUI(QWidget):
         main_layout.addLayout(menu_layout)
 
         content_layout = QHBoxLayout()
-        # minimal margins for uniformity
         content_layout.setContentsMargins(5,5,5,5)
         main_layout.addLayout(content_layout)
 
@@ -217,7 +219,6 @@ class ReferenceChatGUI(QWidget):
         input_layout.addWidget(self.input_text)
         input_layout.addWidget(self.send_button)
 
-        # Input frame is last in left_layout, so at bottom
         left_layout.addWidget(input_frame, 0, Qt.AlignBottom)
 
         # Right side: citations panel
@@ -230,10 +231,10 @@ class ReferenceChatGUI(QWidget):
         right_panel.addWidget(self.right_panel_label)
 
         self.right_container = QFrame()
-        # No dynamic spacing: setSpacing(0), uniform minimal margins
         self.right_inner_layout = QVBoxLayout()
+        # Ensure small, fixed spacing
         self.right_inner_layout.setSpacing(0)
-        self.right_inner_layout.setContentsMargins(0,0,0,0)
+        self.right_inner_layout.setContentsMargins(5,5,5,5)
         self.right_container.setLayout(self.right_inner_layout)
 
         self.right_scroll = QScrollArea()
@@ -242,7 +243,6 @@ class ReferenceChatGUI(QWidget):
         scroll_widget.setLayout(self.right_inner_layout)
         self.right_scroll.setWidget(scroll_widget)
 
-        # Just add the scroll area, no stretch below it, so no dynamic spacing
         right_panel.addWidget(self.right_scroll)
 
         content_layout.addLayout(left_layout, stretch=2)
@@ -250,6 +250,13 @@ class ReferenceChatGUI(QWidget):
 
         self.update_html()
         self.showMaximized()
+
+        # Keyboard shortcuts
+        self.shortcut_new = QShortcut(QKeySequence("Ctrl+N"), self)
+        self.shortcut_new.activated.connect(self.new_session)
+
+        self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.shortcut_save.activated.connect(self.save_session)
 
     def update_html(self):
         html_head = """
@@ -354,9 +361,10 @@ window.MathJax = {
         if not user_input:
             return
 
-        # Render user's message first
         self.append_user_message(user_input)
         self.input_text.clear()
+        # Process events to ensure UI updates before API call
+        QApplication.processEvents()
 
         # Add to history and show typing
         self.messages.append({"role": "user", "content": user_input})
@@ -445,13 +453,21 @@ window.MathJax = {
             snippet = self.get_snippet(r)
             citation_key = r['references'].get('citation_key', 'unknown_key')
             pdf_name = r['pdf_filename']
-            snippet_id = len(self.indexed_snippets) + 1
-            self.indexed_snippets.append({
-                "id": snippet_id,
-                "citation_key": citation_key,
-                "pdf_name": pdf_name,
-                "snippet": snippet
-            })
+
+            # Check if we have seen this snippet before
+            key = (pdf_name, snippet)
+            if key in self.snippet_cache:
+                snippet_id = self.snippet_cache[key]
+            else:
+                snippet_id = len(self.indexed_snippets) + 1
+                self.indexed_snippets.append({
+                    "id": snippet_id,
+                    "citation_key": citation_key,
+                    "pdf_name": pdf_name,
+                    "snippet": snippet
+                })
+                self.snippet_cache[key] = snippet_id
+
             returned_data.append({
                 "pdf_filename": pdf_name,
                 "citation_key": citation_key,
@@ -492,8 +508,7 @@ window.MathJax = {
             if widget:
                 widget.deleteLater()
 
-        # Display all snippets uniformly stacked
-        # No dynamic spacing: setSpacing(0), and each snippet is just one line after another.
+        # Display all snippets stacked with minimal spacing
         for s in self.indexed_snippets:
             result_frame = QFrame()
             result_layout = QHBoxLayout()
@@ -501,7 +516,7 @@ window.MathJax = {
             result_layout.setContentsMargins(0,0,0,0)
             result_frame.setLayout(result_layout)
 
-            label_text = f"[{s['id']}] (Cite: {s['citation_key']})"
+            label_text = f"[{s['id']}] ({s['citation_key']})"
             snippet_label = QLabel(label_text)
             snippet_label.setFont(QFont("Arial", 12))
             snippet_label.setStyleSheet("color: #ffffff;")
@@ -565,11 +580,13 @@ window.MathJax = {
         ]
         self.html_messages = []
         self.indexed_snippets = []
+        self.snippet_cache = {}
         self.displayed_equations = []
         self.typing_indicator_visible = False
         self.update_html()
         self.update_right_panel()
         self.set_send_button_pressed(False)
+        print("New session started.")
 
     def save_session(self):
         session_data = {
@@ -593,6 +610,13 @@ window.MathJax = {
             self.messages = session_data.get("messages", [])
             self.displayed_equations = session_data.get("equations", [])
             self.indexed_snippets = session_data.get("snippets", [])
+
+            # Rebuild the snippet_cache for stability
+            self.snippet_cache = {}
+            for s in self.indexed_snippets:
+                key = (s['pdf_name'], s['snippet'])
+                self.snippet_cache[key] = s['id']
+
             self.html_messages = []
             for m in self.messages:
                 role = m.get('role', 'assistant')
