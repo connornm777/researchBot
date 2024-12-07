@@ -1,25 +1,25 @@
 import sys
 import os
 import json
+import pyperclip
+import time
 import re
-import pyperclip  # For copying to clipboard
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+                             QTextEdit, QPushButton, QLabel, QFrame, QDialog,
+                             QDialogButtonBox, QFileDialog, QScrollArea, QWidget, QSizePolicy)
+from PyQt5.QtGui import QFont, QTextCursor, QKeyEvent
+from PyQt5.QtCore import Qt
+from PyQt5.QtWebEngineWidgets import QWebEngineView
 from dotenv import load_dotenv
 import openai
 
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLineEdit, QPushButton, QLabel, QFrame, QDialog, QTextEdit,
-                             QDialogButtonBox, QMenuBar, QMenu, QFileDialog, QMessageBox)
-from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-
-from data_manager import DataManager  # Your existing DataManager file
+from data_manager import DataManager  # Your DataManager file
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
 GUI_PATH = os.getenv("GUI_PATH", ".")
 
-# Define the tool
 tools = [
     {
         "type": "function",
@@ -54,132 +54,202 @@ class SnippetDialog(QDialog):
         self.text_edit = QTextEdit()
         self.text_edit.setPlainText(snippet)
         self.text_edit.setReadOnly(True)
+        self.text_edit.moveCursor(QTextCursor.End)
         layout.addWidget(self.text_edit)
 
-        button_box = QHBoxLayout()
-        copy_eq_button = QPushButton("Copy as Equation")
-        copy_eq_button.clicked.connect(self.copy_as_equation)
-        button_box.addWidget(copy_eq_button)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
 
-        ok_button = QPushButton("Ok")
-        ok_button.clicked.connect(self.accept)
-        button_box.addWidget(ok_button)
-
-        box_frame = QFrame()
-        box_frame.setLayout(button_box)
-
-        layout.addWidget(box_frame)
         self.setLayout(layout)
         self.resize(600, 400)
-
         self.snippet = snippet
 
-    def copy_as_equation(self):
-        eq_text = f"\\begin{{equation}}\n{self.snippet}\n\\end{{equation}}"
-        pyperclip.copy(eq_text)
+
+class InputTextEdit(QTextEdit):
+    """A QTextEdit that sends the message on Enter and inserts newline on Shift+Enter."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptRichText(False)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ShiftModifier:
+                # Shift+Enter -> newline
+                self.insertPlainText("\n")
+            else:
+                # Enter -> send message
+                self.parent().parent().send_message()
+            return
+        super().keyPressEvent(event)
+
 
 class ReferenceChatGUI(QWidget):
     def __init__(self, dm):
         super().__init__()
         self.dm = dm
 
-        # Messages in conversation
         self.messages = [
             {
                 "role": "system",
                 "content": (
                     "You are a helpful research assistant. "
                     "When the user asks about references or citation keys, call "
-                    "the 'search_references' function if needed."
+                    "the 'search_references' function if needed. "
+                    "If you use a snippet from the references I retrieved, please mark it with a numbered citation like [1], [2], etc. "
+                    "Snippet numbering is cumulative throughout the entire conversation and never resets. "
+                    "Snippet [1] is always the first snippet found in this session, snippet [2] the second, and so on. "
+                    "If you reference snippet [1] again later, it still refers to that same original snippet. "
+                    "Preserve these stable references even after saving/loading sessions."
                 )
             }
         ]
 
-        # We will keep track of session data (messages, citations, equations)
-        self.session_data = {
-            "messages": self.messages,
-            "citations": [],
-            "equations": []
-        }
-
         self.html_messages = []
         self.typing_indicator_visible = False
-        self.last_search_results = []
+
+        self.indexed_snippets = []
+        self.displayed_equations = []
+
+        # Original send button stylesheet
+        self.send_button_normal_style = "background-color: #4CAF50; color: white; padding: 6px 12px;"
+        # Pressed/indented style
+        self.send_button_pressed_style = "background-color: #4CAF50; color: white; padding: 6px 12px; margin-left: 10px;"
 
         self.init_ui()
 
     def init_ui(self):
         self.setWindowTitle("GPT Reference Assistant")
-        self.resize(1200, 800)
+
+        # Dark mode stylesheet with scrollbar theming
+        self.setStyleSheet("""
+        QWidget {
+            background-color: #202020;
+            color: #ffffff;
+        }
+        QTextEdit {
+            background-color: #2a2a2a;
+            color: #ffffff;
+        }
+        QPushButton {
+            background-color: #4CAF50;
+            border: 1px solid #555;
+            padding: 5px;
+        }
+        QPushButton:hover {
+            background-color: #55bd55;
+        }
+        QScrollArea {
+            background-color: #202020;
+        }
+        QScrollBar:vertical {
+            background: #2a2a2a;
+            width: 12px;
+            margin: 0px;
+        }
+        QScrollBar::handle:vertical {
+            background: #4CAF50;
+            border-radius: 4px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            background: none;
+            height: 0;
+        }
+        """)
 
         main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0,0,0,0)
         self.setLayout(main_layout)
 
-        # Menu bar
-        menubar = QMenuBar(self)
-        file_menu = menubar.addMenu("File")
-        new_act = file_menu.addAction("New")
-        new_act.triggered.connect(self.new_session)
-        load_act = file_menu.addAction("Load")
-        load_act.triggered.connect(self.load_session)
-        save_act = file_menu.addAction("Save")
-        save_act.triggered.connect(self.save_session)
-        main_layout.setMenuBar(menubar)
+        # Menu at top
+        menu_layout = QHBoxLayout()
+        new_button = QPushButton("New")
+        new_button.clicked.connect(self.new_session)
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self.save_session)
+        load_button = QPushButton("Load")
+        load_button.clicked.connect(self.load_session)
 
-        # Main content layout
+        menu_layout.addWidget(new_button)
+        menu_layout.addWidget(save_button)
+        menu_layout.addWidget(load_button)
+        menu_layout.addStretch()
+
+        main_layout.addLayout(menu_layout)
+
         content_layout = QHBoxLayout()
+        # minimal margins for uniformity
+        content_layout.setContentsMargins(5,5,5,5)
+        main_layout.addLayout(content_layout)
 
         # Left side: Chat + Input
         left_layout = QVBoxLayout()
+        left_layout.setContentsMargins(5,5,5,5)
+        left_layout.setSpacing(5)
 
         title_label = QLabel("GPT Reference Assistant")
         title_font = QFont("Arial", 20, QFont.Bold)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignHCenter)
+        title_label.setStyleSheet("color: #4CAF50;")
         left_layout.addWidget(title_label)
 
         self.web_view = QWebEngineView()
+        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(self.web_view)
 
+        # Input frame at bottom
         input_frame = QFrame()
         input_layout = QHBoxLayout()
+        input_layout.setContentsMargins(0,0,0,0)
+        input_layout.setSpacing(5)
         input_frame.setLayout(input_layout)
 
-        self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("Type your question here...")
-        self.input_line.setFont(QFont("Arial", 14))
-        self.input_line.returnPressed.connect(self.on_enter_pressed)
-        send_button = QPushButton("Send")
-        send_button.setFont(QFont("Arial", 14))
-        send_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 6px 12px;")
-        send_button.clicked.connect(self.send_message)
+        self.input_text = InputTextEdit()
+        self.input_text.setFont(QFont("Arial", 14))
+        self.input_text.setFixedHeight(100)
 
-        input_layout.addWidget(self.input_line)
-        input_layout.addWidget(send_button)
-        left_layout.addWidget(input_frame)
+        self.send_button = QPushButton("Send")
+        self.send_button.setFont(QFont("Arial", 14))
+        self.send_button.setStyleSheet(self.send_button_normal_style)
+        self.send_button.clicked.connect(self.send_message)
 
-        # Right side: citations and equations panel
-        self.right_panel = QVBoxLayout()
+        input_layout.addWidget(self.input_text)
+        input_layout.addWidget(self.send_button)
 
-        self.right_panel_label = QLabel("Relevant Citations and Equations:")
+        # Input frame is last in left_layout, so at bottom
+        left_layout.addWidget(input_frame, 0, Qt.AlignBottom)
+
+        # Right side: citations panel
+        right_panel = QVBoxLayout()
+        right_panel.setContentsMargins(5,5,5,5)
+        right_panel.setSpacing(5)
+        self.right_panel_label = QLabel("Citations")
         self.right_panel_label.setFont(QFont("Arial", 16, QFont.Bold))
-        self.right_panel.addWidget(self.right_panel_label)
+        self.right_panel_label.setStyleSheet("color: #4CAF50;")
+        right_panel.addWidget(self.right_panel_label)
 
         self.right_container = QFrame()
+        # No dynamic spacing: setSpacing(0), uniform minimal margins
         self.right_inner_layout = QVBoxLayout()
+        self.right_inner_layout.setSpacing(0)
+        self.right_inner_layout.setContentsMargins(0,0,0,0)
         self.right_container.setLayout(self.right_inner_layout)
 
-        self.right_panel.addWidget(self.right_container)
-        self.right_panel.addStretch()
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_widget.setLayout(self.right_inner_layout)
+        self.right_scroll.setWidget(scroll_widget)
 
-        content_layout.addLayout(left_layout, stretch=3)
-        content_layout.addLayout(self.right_panel, stretch=1)
+        # Just add the scroll area, no stretch below it, so no dynamic spacing
+        right_panel.addWidget(self.right_scroll)
 
-        main_layout.addLayout(content_layout)
+        content_layout.addLayout(left_layout, stretch=2)
+        content_layout.addLayout(right_panel, stretch=1)
+
         self.update_html()
-
-    def on_enter_pressed(self):
-        self.send_message()
+        self.showMaximized()
 
     def update_html(self):
         html_head = """
@@ -189,38 +259,43 @@ class ReferenceChatGUI(QWidget):
 <meta charset="UTF-8">
 <style>
 body {
+  background-color: #202020;
+  color: #ffffff;
   font-family: sans-serif;
   font-size: 16px;
-  background: #f0f0f0;
-  margin: 20px;
-  line-height: 1.5;
+  margin: 0px;
+  padding: 20px;
+  line-height: 1.4;
 }
 .message-user {
-  background: #e0e0e0; 
-  color: #000000;
+  background: #404040; 
+  color: #ffffff;
   display: inline-block;
   padding: 10px;
   border-radius: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
   max-width: 60%;
 }
 .message-assistant {
-  background: #ffffff; 
-  color: #000000;
+  background: #303030; 
+  color: #ffffff;
   display: inline-block;
   padding: 10px;
   border-radius: 8px;
-  margin-bottom: 10px;
+  margin-bottom: 6px;
   max-width: 60%;
 }
 .message-container {
   text-align: left;
-  margin: 10px 0;
+  margin: 6px 0;
 }
 .typing {
-  color: #999999;
+  color: #aaaaaa;
   font-style: italic;
-  margin: 10px 0;
+  margin: 6px 0;
+}
+a {
+  color: #4CAF50;
 }
 </style>
 <!-- Load MathJax -->
@@ -233,9 +308,7 @@ window.MathJax = {
 </head>
 <body>
 """
-        html_body = ""
-        for msg_html in self.html_messages:
-            html_body += msg_html
+        html_body = "".join(self.html_messages)
 
         if self.typing_indicator_visible:
             html_body += '<div class="typing">GPT is typing...</div>'
@@ -246,59 +319,69 @@ window.MathJax = {
 """
         full_html = html_head + html_body + html_footer
         self.web_view.setHtml(full_html)
-        # After rendering, typeset math and scroll down
-        self.web_view.page().runJavaScript("MathJax.typeset();", self.scroll_down)
-
-    def scroll_down(self, _=None):
+        self.web_view.page().runJavaScript("MathJax.typeset();")
         self.web_view.page().runJavaScript("window.scrollTo(0, document.body.scrollHeight);")
+        self.web_view.update()
 
     def append_user_message(self, message):
         self.html_messages.append(
             f'<div class="message-container"><div class="message-user"><b>You:</b><br>{message}</div></div>'
         )
         self.update_html()
+        self.web_view.update()
 
     def append_assistant_message(self, message):
-        self.html_messages.append(
-            f'<div class="message-container"><div class="message-assistant"><b>GPT:</b><br>{message}</div></div>'
-        )
-        self.update_html()
+        if message and message.strip():
+            self.html_messages.append(
+                f'<div class="message-container"><div class="message-assistant"><b>GPT:</b><br>{message}</div></div>'
+            )
+            self.update_html()
+            self.web_view.update()
 
     def show_typing_indicator(self, show=True):
         self.typing_indicator_visible = show
         self.update_html()
+        self.web_view.update()
+
+    def set_send_button_pressed(self, pressed=True):
+        if pressed:
+            self.send_button.setStyleSheet(self.send_button_pressed_style)
+        else:
+            self.send_button.setStyleSheet(self.send_button_normal_style)
 
     def send_message(self):
-        user_input = self.input_line.text().strip()
+        user_input = self.input_text.toPlainText().strip()
         if not user_input:
             return
 
-        # Render user's message before adding to history or querying GPT
+        # Render user's message first
         self.append_user_message(user_input)
-        self.input_line.clear()
-        QApplication.processEvents()
+        self.input_text.clear()
 
-        # Now add to history and call GPT
-        self.session_data["messages"].append({"role": "user", "content": user_input})
+        # Add to history and show typing
+        self.messages.append({"role": "user", "content": user_input})
         self.show_typing_indicator(True)
-        QApplication.processEvents()
 
+        # Indent send button while waiting
+        self.set_send_button_pressed(True)
+
+        # Now query GPT
         self.user_query(user_input)
 
     def user_query(self, user_message):
         response = openai.chat.completions.create(
             model="gpt-4o",
-            messages=self.session_data["messages"],
+            messages=self.messages,
             tools=tools
         )
         self.handle_response(response)
 
     def handle_response(self, response):
+        self.show_typing_indicator(False)
         choice = response.choices[0]
         msg = choice.message
 
         tool_calls = getattr(msg, 'tool_calls', []) or []
-        self.show_typing_indicator(False)
         if tool_calls:
             tool_call = tool_calls[0]
             function_name = tool_call.function.name
@@ -306,84 +389,101 @@ window.MathJax = {
 
             if function_name == "search_references":
                 self.show_typing_indicator(True)
-                QApplication.processEvents()
-
                 results = self.handle_search_tool(arguments["query"], arguments.get("top_k", 3))
                 tool_response_message = {
                     "role": "tool",
                     "content": json.dumps(results),
                     "tool_call_id": tool_call.id
                 }
-                self.session_data["messages"].append(msg.dict())
-                self.session_data["messages"].append(tool_response_message)
+                self.messages.append(msg.dict())
+                self.messages.append(tool_response_message)
 
                 followup_response = openai.chat.completions.create(
                     model="gpt-4o",
-                    messages=self.session_data["messages"],
+                    messages=self.messages,
                     tools=tools
                 )
                 self.show_typing_indicator(False)
                 self.handle_final_answer(followup_response)
             else:
-                self.append_assistant_message("I tried to call an unknown function.")
+                # Unknown function
+                self.set_send_button_pressed(False)
         else:
-            assistant_content = msg.content
-            if assistant_content:
-                self.session_data["messages"].append({"role": "assistant", "content": assistant_content})
+            assistant_content = msg.content if msg.content else ""
+            if assistant_content.strip():
+                self.messages.append({"role": "assistant", "content": assistant_content})
                 self.append_assistant_message(assistant_content)
-                # Update right panel (no new tool call)
-                self.extract_equations(assistant_content)
+                eqs = self.extract_equations(assistant_content)
+                for eq_full in eqs:
+                    if eq_full not in self.displayed_equations:
+                        self.displayed_equations.append(eq_full)
                 self.update_right_panel()
+
+            # Done responding
+            self.set_send_button_pressed(False)
 
     def handle_final_answer(self, followup_response):
         choice = followup_response.choices[0]
         final_msg = choice.message
-        assistant_content = final_msg.content
-        if assistant_content:
-            self.session_data["messages"].append({"role": "assistant", "content": assistant_content})
+        assistant_content = final_msg.content if final_msg.content else ""
+        if assistant_content.strip():
+            self.messages.append({"role": "assistant", "content": assistant_content})
             self.append_assistant_message(assistant_content)
-        self.extract_equations(assistant_content)
+            eqs = self.extract_equations(assistant_content)
+            for eq_full in eqs:
+                if eq_full not in self.displayed_equations:
+                    self.displayed_equations.append(eq_full)
         self.update_right_panel()
+
+        # Done responding
+        self.set_send_button_pressed(False)
 
     def handle_search_tool(self, query, top_k):
         results = self.dm.search(query, top_k=top_k)
-        data = []
-        self.last_search_results = results  # Store for right panel
-        # Add citations to session_data
+        returned_data = []
         for r in results:
-            pdf_name = r['pdf_filename']
+            snippet = self.get_snippet(r)
             citation_key = r['references'].get('citation_key', 'unknown_key')
-            chunk_file = r['chunk_filename']
-            chunk_path = os.path.join(self.dm.CHUNK_PATH, chunk_file)
-            try:
-                with open(chunk_path, 'r', encoding='utf-8') as f:
-                    snippet = f.read().strip()
-            except:
-                snippet = "Could not read chunk."
-            r['snippet'] = snippet
-            r['pdf_filename'] = pdf_name
-            r['citation_key'] = citation_key
-
-            data.append({
+            pdf_name = r['pdf_filename']
+            snippet_id = len(self.indexed_snippets) + 1
+            self.indexed_snippets.append({
+                "id": snippet_id,
+                "citation_key": citation_key,
+                "pdf_name": pdf_name,
+                "snippet": snippet
+            })
+            returned_data.append({
                 "pdf_filename": pdf_name,
                 "citation_key": citation_key,
                 "snippet": snippet,
                 "similarity_score": r['similarity_score']
             })
-            # Store citation keys
-            self.session_data["citations"].append(citation_key)
-        return {"results": data}
+        return {"results": returned_data}
+
+    def get_snippet(self, result):
+        chunk_file = result['chunk_filename']
+        chunk_path = os.path.join(self.dm.CHUNK_PATH, chunk_file)
+        try:
+            with open(chunk_path, 'r', encoding='utf-8') as f:
+                snippet = f.read().strip()
+        except:
+            snippet = "Could not read chunk."
+        return snippet
 
     def extract_equations(self, text):
-        # Find all equations of the form:
-        # \begin{equation}
-        # ...
-        # \end{equation}
-        pattern = r'\\begin{equation}(.*?)\\end{equation}'
-        matches = re.findall(pattern, text, flags=re.DOTALL)
-        for eq in matches:
-            eq_str = eq.strip()
-            self.session_data["equations"].append(eq_str)
+        equations = []
+        start = 0
+        while True:
+            start_eq = text.find("\\begin{equation}", start)
+            if start_eq == -1:
+                break
+            end_eq = text.find("\\end{equation}", start_eq)
+            if end_eq == -1:
+                break
+            eq_full = text[start_eq:end_eq+len("\\end{equation}")]
+            equations.append(eq_full)
+            start = end_eq+len("\\end{equation}")
+        return equations
 
     def update_right_panel(self):
         # Clear old widgets
@@ -392,59 +492,53 @@ window.MathJax = {
             if widget:
                 widget.deleteLater()
 
-        # First show citations if any
-        if self.last_search_results:
-            # Citations from last search
-            for r in self.last_search_results:
-                citation_key = r['citation_key']
-                snippet = r['snippet']
-                pdf_name = r['pdf_filename']
+        # Display all snippets uniformly stacked
+        # No dynamic spacing: setSpacing(0), and each snippet is just one line after another.
+        for s in self.indexed_snippets:
+            result_frame = QFrame()
+            result_layout = QHBoxLayout()
+            result_layout.setSpacing(0)
+            result_layout.setContentsMargins(0,0,0,0)
+            result_frame.setLayout(result_layout)
 
-                result_frame = QFrame()
-                result_layout = QHBoxLayout()
-                result_frame.setLayout(result_layout)
+            label_text = f"[{s['id']}] (Cite: {s['citation_key']})"
+            snippet_label = QLabel(label_text)
+            snippet_label.setFont(QFont("Arial", 12))
+            snippet_label.setStyleSheet("color: #ffffff;")
+            result_layout.addWidget(snippet_label)
 
-                cite_key_label = QLabel(f"Citation: {citation_key}")
-                cite_key_label.setFont(QFont("Arial", 12))
-                result_layout.addWidget(cite_key_label)
+            cite_button = QPushButton("Copy Cite")
+            cite_button.setFont(QFont("Arial", 10))
+            citation_text = f"\\cite{{{s['citation_key']}}}"
+            cite_button.clicked.connect(lambda ch, ctext=citation_text: self.copy_to_clipboard(ctext))
+            result_layout.addWidget(cite_button)
 
-                # Button to copy citation
-                cite_button = QPushButton("Copy Cite")
-                cite_button.setFont(QFont("Arial", 10))
-                citation_text = f"\\cite{{{citation_key}}}"
-                cite_button.clicked.connect(lambda ch, ctext=citation_text: self.copy_to_clipboard(ctext))
-                result_layout.addWidget(cite_button)
+            snippet_button = QPushButton("Show Snippet")
+            snippet_button.setFont(QFont("Arial", 10))
+            snippet_button.clicked.connect(lambda ch, sn=s: self.show_snippet_dialog(sn['snippet'], sn['pdf_name']))
+            result_layout.addWidget(snippet_button)
 
-                # Button to show snippet
-                snippet_button = QPushButton("Show Snippet")
-                snippet_button.setFont(QFont("Arial", 10))
-                snippet_button.clicked.connect(lambda ch, s=snippet, p=pdf_name: self.show_snippet_dialog(s, p))
-                result_layout.addWidget(snippet_button)
+            self.right_inner_layout.addWidget(result_frame)
 
-                self.right_inner_layout.addWidget(result_frame)
+        # Equations directly after snippets
+        for eq_full in self.displayed_equations:
+            eq_frame = QFrame()
+            eq_layout = QHBoxLayout()
+            eq_layout.setSpacing(0)
+            eq_layout.setContentsMargins(0,0,0,0)
+            eq_frame.setLayout(eq_layout)
 
-        # Now show equations from the entire session
-        if self.session_data["equations"]:
-            eq_label = QLabel("Equations:")
-            eq_label.setFont(QFont("Arial", 14, QFont.Bold))
-            self.right_inner_layout.addWidget(eq_label)
+            eq_label = QLabel("[Equation]")
+            eq_label.setFont(QFont("Arial", 12))
+            eq_label.setStyleSheet("color: #ffffff;")
+            eq_layout.addWidget(eq_label)
 
-            for eq_str in self.session_data["equations"]:
-                eq_frame = QFrame()
-                eq_layout = QHBoxLayout()
-                eq_frame.setLayout(eq_layout)
+            copy_eq_button = QPushButton("Copy Equation")
+            copy_eq_button.setFont(QFont("Arial", 10))
+            copy_eq_button.clicked.connect(lambda ch, eq=eq_full: self.copy_to_clipboard(eq))
+            eq_layout.addWidget(copy_eq_button)
 
-                eq_preview = QLabel("Equation found")
-                eq_preview.setFont(QFont("Arial", 12))
-                eq_layout.addWidget(eq_preview)
-
-                copy_eq_button = QPushButton("Copy Equation")
-                copy_eq_button.setFont(QFont("Arial", 10))
-                full_eq = f"\\begin{{equation}}\n{eq_str}\n\\end{{equation}}"
-                copy_eq_button.clicked.connect(lambda ch, feq=full_eq: self.copy_to_clipboard(feq))
-                eq_layout.addWidget(copy_eq_button)
-
-                self.right_inner_layout.addWidget(eq_frame)
+            self.right_inner_layout.addWidget(eq_frame)
 
     def copy_to_clipboard(self, text):
         pyperclip.copy(text)
@@ -454,74 +548,74 @@ window.MathJax = {
         dialog.exec_()
 
     def new_session(self):
-        reply = QMessageBox.question(
-            self, "New Session", "Are you sure you want to start a new session? Unsaved data will be lost.",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            self.messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful research assistant. "
-                        "When the user asks about references or citation keys, call "
-                        "the 'search_references' function if needed."
-                    )
-                }
-            ]
-            self.session_data = {
-                "messages": self.messages,
-                "citations": [],
-                "equations": []
+        self.messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful research assistant. "
+                    "When the user asks about references or citation keys, call "
+                    "the 'search_references' function if needed. "
+                    "If you use a snippet from the references I retrieved, please mark it with a numbered citation like [1], [2], etc. "
+                    "Snippet numbering is cumulative throughout the entire conversation and never resets. "
+                    "Snippet [1] is always the first snippet found in this session, snippet [2] the second, and so on. "
+                    "If you reference snippet [1] again later, it still refers to that same original snippet. "
+                    "Preserve these stable references even after saving/loading sessions."
+                )
             }
-            self.html_messages = []
-            self.last_search_results = []
-            self.update_right_panel()
-            self.update_html()
+        ]
+        self.html_messages = []
+        self.indexed_snippets = []
+        self.displayed_equations = []
+        self.typing_indicator_visible = False
+        self.update_html()
+        self.update_right_panel()
+        self.set_send_button_pressed(False)
 
     def save_session(self):
-        if not os.path.exists(GUI_PATH):
-            os.makedirs(GUI_PATH)
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Session", GUI_PATH, "JSON Files (*.json)")
-        if file_path:
-            # Save session_data
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.session_data, f, indent=4)
-            QMessageBox.information(self, "Saved", f"Session saved to {file_path}")
+        session_data = {
+            "messages": self.messages,
+            "equations": self.displayed_equations,
+            "snippets": self.indexed_snippets
+        }
+        timestamp = int(time.time())
+        save_path = os.path.join(GUI_PATH, f"session_{timestamp}.json")
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, indent=4)
+        print(f"Session saved to {save_path}")
 
     def load_session(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Load Session", GUI_PATH, "JSON Files (*.json)")
-        if file_path:
+        dlg = QFileDialog(self, "Load Session", GUI_PATH, "JSON Files (*.json)")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        if dlg.exec_() == QFileDialog.Accepted:
+            file_path = dlg.selectedFiles()[0]
             with open(file_path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-
-            # Load back into UI
-            self.session_data = loaded
-            self.messages = self.session_data["messages"]
-
-            # Rebuild the html_messages from messages
+                session_data = json.load(f)
+            self.messages = session_data.get("messages", [])
+            self.displayed_equations = session_data.get("equations", [])
+            self.indexed_snippets = session_data.get("snippets", [])
             self.html_messages = []
             for m in self.messages:
-                role = m["role"]
-                content = m["content"]
-                if role == "user":
-                    self.html_messages.append(
-                        f'<div class="message-container"><div class="message-user"><b>You:</b><br>{content}</div></div>'
-                    )
-                elif role == "assistant":
-                    self.html_messages.append(
-                        f'<div class="message-container"><div class="message-assistant"><b>GPT:</b><br>{content}</div></div>'
-                    )
-            self.last_search_results = []  # no stored last search results
-            # We only have citations and equations
-            self.update_right_panel()
+                role = m.get('role', 'assistant')
+                cont = m.get("content", None)
+                if cont and cont.strip():
+                    if role == 'user':
+                        self.html_messages.append(
+                            f'<div class="message-container"><div class="message-user"><b>You:</b><br>{cont}</div></div>'
+                        )
+                    elif role == 'assistant':
+                        self.html_messages.append(
+                            f'<div class="message-container"><div class="message-assistant"><b>GPT:</b><br>{cont}</div></div>'
+                        )
+
+            self.typing_indicator_visible = False
             self.update_html()
-            QMessageBox.information(self, "Loaded", f"Session loaded from {file_path}")
+            self.update_right_panel()
+            self.set_send_button_pressed(False)
+            print(f"Session loaded from {file_path}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     dm = DataManager()
     window = ReferenceChatGUI(dm)
-    window.show()
     sys.exit(app.exec_())
