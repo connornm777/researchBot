@@ -17,8 +17,7 @@ from data_manager import DataManager  # Your DataManager file
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
-GUI_PATH = os.getenv("GUI_PATH", ".")
+app_sessions_path = os.path.join(os.getenv("DATA_SERVER"), "app_sessions")
 
 tools = [
     {
@@ -478,7 +477,7 @@ window.MathJax = {
 
     def get_snippet(self, result):
         chunk_file = result['chunk_filename']
-        chunk_path = os.path.join(self.dm.CHUNK_PATH, chunk_file)
+        chunk_path = os.path.join(self.dm.chunk_files_directory, chunk_file)
         try:
             with open(chunk_path, 'r', encoding='utf-8') as f:
                 snippet = f.read().strip()
@@ -595,13 +594,13 @@ window.MathJax = {
             "snippets": self.indexed_snippets
         }
         timestamp = int(time.time())
-        save_path = os.path.join(GUI_PATH, f"session_{timestamp}.json")
+        save_path = os.path.join(app_sessions_path, f"session_{timestamp}.json")
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(session_data, f, indent=4)
         print(f"Session saved to {save_path}")
 
     def load_session(self):
-        dlg = QFileDialog(self, "Load Session", GUI_PATH, "JSON Files (*.json)")
+        dlg = QFileDialog(self, "Load Session", app_sessions_path, "JSON Files (*.json)")
         dlg.setFileMode(QFileDialog.ExistingFile)
         if dlg.exec_() == QFileDialog.Accepted:
             file_path = dlg.selectedFiles()[0]

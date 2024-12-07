@@ -2,7 +2,7 @@ import os, pdb
 import json
 import openai
 import tiktoken
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 import numpy as np
 from pdfminer.high_level import extract_text
 from PyPDF2 import PdfReader
@@ -11,23 +11,28 @@ class DataManager:
 
     def __init__(self):
         # Load environment variables from .env file
-        for key, value in dotenv_values().items():
-            setattr(self, key, value)
-
+        load_dotenv()
+        openai.api_key = os.getenv('OPENAI_API_KEY')
+        data_server = os.getenv('DATA_SERVER')
+        self.metadata_file = os.path.join(data_server, 'metadata.json')
+        self.embedding_file = os.path.join(data_server, 'embeddings.npy')
+        self.reference_file = os.path.join(data_server, 'references.bib')
+        self.pdf_files_directory = os.path.join(data_server, 'pdfs/')
+        self.text_files_directory = os.path.join(data_server, 'text/')
+        self.chunk_files_directory = os.path.join(data_server, 'chunks/')
+        self.unscannable_pdfs_path = os.path.join(data_server, 'pdfs/unscannable/')
         # Set OpenAI API key
-        openai.api_key = getattr(self, 'OPENAI_API_KEY', None)
-
+        openai.api_key = os.getenv('OPENAI_API_KEY')
         # Set models and encoder
-        self.TIKTOKEN_MODEL = getattr(self, 'TIKTOKEN_MODEL', 'gpt-3.5-turbo')
-        self.PARSE_MODEL = getattr(self, 'PARSE_MODEL', self.TIKTOKEN_MODEL)
-        self.EMB_MODEL = getattr(self, 'EMB_MODEL', 'text-embedding-ada-002')
-        self.encoder = tiktoken.encoding_for_model(self.TIKTOKEN_MODEL)
-
+        self.tiktoken_model = os.getenv("TIKTOKEN_MODEL")
+        self.parsing_model = os.getenv("PARSING_MODEL")
+        self.embedding_model = os.getenv("EMBEDDING_MODEL")
+        self.encoder = tiktoken.encoding_for_model(self.tiktoken_model)
         # Convert parameters to appropriate types
-        self.MAX_TOKENS_PER_CHUNK = int(self.MAX_TOKENS_PER_CHUNK)
-        self.OVERLAP_TOKENS = int(self.OVERLAP_TOKENS)
+        self.max_tokens_per_chunk = int(os.getenv('MAX_TOKENS_PER_CHUNK'))
+        self.overlap_tokens = int(os.getenv('OVERLAP_TOKENS'))
         # Batch size (adjust as appropriate)
-        self.batch_size = int(8000/self.MAX_TOKENS_PER_CHUNK)
+        self.batch_size = int(8000 / self.max_tokens_per_chunk)
         # Initialize metadata and embeddings
         self.metadata = self.load_metadata()
         self.embeddings = self.load_embeddings()
@@ -36,32 +41,32 @@ class DataManager:
         return len(self.encoder.encode(text))
 
     def load_metadata(self):
-        if os.path.exists(self.META_PATH):
-            with open(self.META_PATH, 'r') as f:
+        if os.path.exists(self.metadata_file):
+            with open(self.metadata_file, 'r') as f:
                 return json.load(f)
         else:
             return {}
 
     def save_metadata(self):
-        with open(self.META_PATH, 'w') as f:
+        with open(self.metadata_file, 'w') as f:
             json.dump(self.metadata, f, indent=4)
 
     def load_embeddings(self):
-        if os.path.exists(self.EMB_PATH):
-            embeddings = np.load(self.EMB_PATH)
+        if os.path.exists(self.embedding_file):
+            embeddings = np.load(self.embedding_file)
             return embeddings
         else:
             return np.array([])
 
     def save_embeddings(self):
-        np.save(self.EMB_PATH, self.embeddings)
+        np.save(self.embedding_file, self.embeddings)
 
     def update_metadata(self):
         """
         Updates the metadata by adding any new PDFs found in the PDF_PATH directory.
         Only PDFs listed in the metadata will be processed by other functions.
         """
-        pdf_files = [f for f in os.listdir(self.PDF_PATH) if f.endswith('.pdf')]
+        pdf_files = [f for f in os.listdir(self.pdf_files_directory) if f.endswith('.pdf')]
         new_pdfs_found = False
 
         for pdf_filename in pdf_files:
@@ -131,11 +136,11 @@ class DataManager:
                 print(f"Error converting {pdf_filename} to text: {e}")
 
     def convert_pdf_to_text(self, pdf_filename):
-        pdf_path = os.path.join(self.PDF_PATH, pdf_filename)
+        pdf_path = os.path.join(self.pdf_files_directory, pdf_filename)
         text_filename = os.path.splitext(pdf_filename)[0] + '.txt'
-        text_path = os.path.join(self.TXT_PATH, text_filename)
+        text_path = os.path.join(self.text_files_directory, text_filename)
 
-        os.makedirs(self.TXT_PATH, exist_ok=True)
+        os.makedirs(self.text_files_directory, exist_ok=True)
 
         text = extract_text(pdf_path)
         with open(text_path, 'w', encoding='utf-8') as f:
@@ -182,9 +187,9 @@ class DataManager:
                 continue
 
             text_filename = data['text_filename']
-            text_path = os.path.join(self.TXT_PATH, text_filename)
+            text_path = os.path.join(self.text_files_directory, text_filename)
             base_filename = os.path.splitext(text_filename)[0]
-            os.makedirs(self.CHUNK_PATH, exist_ok=True)
+            os.makedirs(self.chunk_files_directory, exist_ok=True)
 
             try:
                 with open(text_path, 'r', encoding='utf-8') as f:
@@ -193,8 +198,8 @@ class DataManager:
                 # Use chunk_text to get the chunks
                 chunks = self.chunk_text(
                     text,
-                    max_tokens=self.MAX_TOKENS_PER_CHUNK,
-                    overlap=self.OVERLAP_TOKENS
+                    max_tokens=self.max_tokens_per_chunk,
+                    overlap=self.overlap_tokens
                 )
 
                 # Write chunks to disk with appropriate padding
@@ -202,7 +207,7 @@ class DataManager:
                 chunk_metadata_list = []
                 for idx, chunk in enumerate(chunks):
                     chunk_filename = f"{base_filename}_chunk{str(idx).zfill(num_digits)}.txt"
-                    chunk_file_path = os.path.join(self.CHUNK_PATH, chunk_filename)
+                    chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
                     with open(chunk_file_path, 'w', encoding='utf-8') as f:
                         f.write(chunk)
                     chunk_metadata = {
@@ -264,8 +269,8 @@ class DataManager:
         embedding_indexes_to_remove = []
         for pdf_filename in to_remove:
             if self.metadata[pdf_filename]['converted_to_text']:
-                os.remove(os.path.join(self.TXT_PATH, self.metadata[pdf_filename]['text_filename']))
-            os.replace(os.path.join(self.PDF_PATH, pdf_filename), os.path.join(self.MAN_PATH, pdf_filename))
+                os.remove(os.path.join(self.text_files_directory, self.metadata[pdf_filename]['text_filename']))
+            os.replace(os.path.join(self.pdf_files_directory, pdf_filename), os.path.join(self.unscannable_pdfs_path, pdf_filename))
             data = self.metadata[pdf_filename]
             # Collect all embedding indexes from the chunks
             chunks = data.get('chunks', [])
@@ -344,9 +349,9 @@ class DataManager:
 
         # Optionally remove the existing references.bib file if you want a fresh start
         # Comment this out if you prefer to keep the old file
-        if os.path.exists(self.REF_PATH):
-            os.remove(self.REF_PATH)
-            print(f"Removed old {self.REF_PATH} file.")
+        if os.path.exists(self.reference_file):
+            os.remove(self.reference_file)
+            print(f"Removed old {self.reference_file} file.")
 
     def extract_references(self):
         """
@@ -367,7 +372,7 @@ class DataManager:
                 # Get the first chunk metadata
                 first_chunk_meta = data['chunks'][0]
                 chunk_filename = first_chunk_meta['filename']
-                chunk_file_path = os.path.join(self.CHUNK_PATH, chunk_filename)
+                chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
                 with open(chunk_file_path, 'r', encoding='utf-8') as f:
                     first_chunk_text = f.read()
 
@@ -435,7 +440,7 @@ class DataManager:
 
                 # Call the OpenAI API
                 response = openai.chat.completions.create(
-                    model=self.PARSE_MODEL,
+                    model=self.data_parse_model,
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system",
@@ -466,7 +471,7 @@ class DataManager:
         of the metadata entries.
         """
         try:
-            with open(self.REF_PATH, 'w', encoding='utf-8') as f:
+            with open(self.reference_file, 'w', encoding='utf-8') as f:
                 for pdf_filename, data in self.metadata.items():
                     references = data.get('references', {})
                     if not references:
@@ -507,7 +512,7 @@ class DataManager:
                     bib_entry += "}\n\n"
 
                     f.write(bib_entry)
-            print(f"Generated {self.REF_PATH} using references data.")
+            print(f"Generated {self.reference_file} using references data.")
         except Exception as e:
             print(f"Error generating references.bib: {e}")
 
@@ -548,7 +553,7 @@ class DataManager:
                     continue  # Embedding already exists
                 # Read the chunk text
                 chunk_filename = chunk_meta['filename']
-                chunk_file_path = os.path.join(self.CHUNK_PATH, chunk_filename)
+                chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
                 try:
                     with open(chunk_file_path, 'r', encoding='utf-8') as f:
                         text = f.read()
@@ -642,3 +647,6 @@ if __name__ == "__main__":
     dm.process_pdfs()
     dm.chunk_text_files()
     dm.process_embeddings()
+    dm.extract_references()
+    dm.generate_references_bib()
+    dm.remove_problematic_entries()
