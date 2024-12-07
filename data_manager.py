@@ -122,7 +122,6 @@ class DataManager:
         """
         for pdf_filename in self.metadata:
             if self.metadata[pdf_filename]['converted_to_text']:
-                print(f"Text for {pdf_filename} already exists. Skipping conversion.")
                 continue
 
             # Convert PDF to text
@@ -179,11 +178,9 @@ class DataManager:
         """
         for pdf_filename, data in self.metadata.items():
             if not data.get('converted_to_text'):
-                print(f"PDF {pdf_filename} has not been converted to text yet. Skipping.")
                 continue
 
             if data.get('chunked'):
-                print(f"Text for {pdf_filename} already chunked. Skipping.")
                 continue
 
             text_filename = data['text_filename']
@@ -361,11 +358,9 @@ class DataManager:
         """
         for pdf_filename, data in self.metadata.items():
             if not data.get('chunked'):
-                print(f"Text for {pdf_filename} has not been chunked yet. Skipping metadata extraction.")
                 continue
 
             if data.get('references_extracted'):
-                print(f"References for {pdf_filename} already extracted. Skipping.")
                 continue
 
             try:
@@ -440,7 +435,7 @@ class DataManager:
 
                 # Call the OpenAI API
                 response = openai.chat.completions.create(
-                    model=self.data_parse_model,
+                    model=self.parsing_model,
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system",
@@ -528,7 +523,7 @@ class DataManager:
         """
         response = openai.embeddings.create(
             input=texts,
-            model=self.EMB_MODEL
+            model=self.embedding_model
         )
         embeddings = [data.embedding for data in response.data]
         return embeddings
@@ -543,13 +538,12 @@ class DataManager:
         chunk_texts = []
         for pdf_filename, data in self.metadata.items():
             if not data.get('chunked'):
-                print(f"Text for {pdf_filename} has not been chunked yet. Skipping embeddings.")
                 continue
 
             # Go through each chunk
             chunks = data['chunks']
             for chunk_meta in chunks:
-                if chunk_meta.get('embedding_index') is not None:
+                if isinstance(chunk_meta.get('embedding_index'), int):
                     continue  # Embedding already exists
                 # Read the chunk text
                 chunk_filename = chunk_meta['filename']
@@ -648,5 +642,5 @@ if __name__ == "__main__":
     dm.chunk_text_files()
     dm.process_embeddings()
     dm.extract_references()
-    dm.generate_references_bib()
-    dm.remove_problematic_entries()
+    #dm.generate_references_bib()
+    #dm.remove_problematic_entries()
