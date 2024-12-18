@@ -642,5 +642,5 @@ if __name__ == "__main__":
     dm.chunk_text_files()
     dm.process_embeddings()
     dm.extract_references()
-    #dm.generate_references_bib()
-    #dm.remove_problematic_entries()
+    dm.generate_references_bib()
+    dm.remove_problematic_entries()

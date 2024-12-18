@@ -8,8 +8,9 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QTextEdit, QPushButton, QLabel, QFrame, QDialog,
                              QDialogButtonBox, QFileDialog, QScrollArea, QWidget, QSizePolicy, QShortcut)
 from PyQt5.QtGui import QFont, QTextCursor, QKeyEvent, QKeySequence
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtGui import QDesktopServices
 from dotenv import load_dotenv
 import openai
 
@@ -88,6 +89,7 @@ class ReferenceChatGUI(QWidget):
         super().__init__()
         self.dm = dm
 
+        # System message without snippet numbering instructions
         self.messages = [
             {
                 "role": "system",
@@ -95,11 +97,8 @@ class ReferenceChatGUI(QWidget):
                     "You are a helpful research assistant. "
                     "When the user asks about references or citation keys, call "
                     "the 'search_references' function if needed. "
-                    "If you use a snippet from the references I retrieved, please mark it with a numbered citation like [1], [2], etc. "
-                    "Snippet numbering is cumulative throughout the entire conversation and never resets. "
-                    "Snippet [1] is always the first snippet found in this session, snippet [2] the second, and so on. "
-                    "If you reference snippet [1] again later, it still refers to that same original snippet. "
-                    "Preserve these stable references even after saving/loading sessions."
+                    "You have a database of snippets and their references on the right panel. "
+                    "You do not need to label or number the snippets in your response text."
                 )
             }
         ]
@@ -231,7 +230,6 @@ class ReferenceChatGUI(QWidget):
 
         self.right_container = QFrame()
         self.right_inner_layout = QVBoxLayout()
-        # Ensure small, fixed spacing
         self.right_inner_layout.setSpacing(0)
         self.right_inner_layout.setContentsMargins(5,5,5,5)
         self.right_container.setLayout(self.right_inner_layout)
@@ -507,15 +505,16 @@ window.MathJax = {
             if widget:
                 widget.deleteLater()
 
-        # Display all snippets stacked with minimal spacing
+        # Display all snippets stacked
         for s in self.indexed_snippets:
             result_frame = QFrame()
             result_layout = QHBoxLayout()
-            result_layout.setSpacing(0)
+            result_layout.setSpacing(5)
             result_layout.setContentsMargins(0,0,0,0)
             result_frame.setLayout(result_layout)
 
-            label_text = f"[{s['id']}] ({s['citation_key']})"
+            # Show just the citation key
+            label_text = f"Citation: {s['citation_key']}"
             snippet_label = QLabel(label_text)
             snippet_label.setFont(QFont("Arial", 12))
             snippet_label.setStyleSheet("color: #ffffff;")
@@ -532,13 +531,18 @@ window.MathJax = {
             snippet_button.clicked.connect(lambda ch, sn=s: self.show_snippet_dialog(sn['snippet'], sn['pdf_name']))
             result_layout.addWidget(snippet_button)
 
+            pdf_button = QPushButton("Open PDF")
+            pdf_button.setFont(QFont("Arial", 10))
+            pdf_button.clicked.connect(lambda ch, pdfn=s['pdf_name']: self.open_pdf(pdfn))
+            result_layout.addWidget(pdf_button)
+
             self.right_inner_layout.addWidget(result_frame)
 
         # Equations directly after snippets
         for eq_full in self.displayed_equations:
             eq_frame = QFrame()
             eq_layout = QHBoxLayout()
-            eq_layout.setSpacing(0)
+            eq_layout.setSpacing(5)
             eq_layout.setContentsMargins(0,0,0,0)
             eq_frame.setLayout(eq_layout)
 
@@ -561,6 +565,13 @@ window.MathJax = {
         dialog = SnippetDialog(snippet, pdf_name, self)
         dialog.exec_()
 
+    def open_pdf(self, pdf_filename):
+        pdf_path = os.path.join(self.dm.pdf_files_directory, pdf_filename)
+        if os.path.exists(pdf_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
+        else:
+            print("PDF file not found:", pdf_path)
+
     def new_session(self):
         self.messages = [
             {
@@ -569,11 +580,8 @@ window.MathJax = {
                     "You are a helpful research assistant. "
                     "When the user asks about references or citation keys, call "
                     "the 'search_references' function if needed. "
-                    "If you use a snippet from the references I retrieved, please mark it with a numbered citation like [1], [2], etc. "
-                    "Snippet numbering is cumulative throughout the entire conversation and never resets. "
-                    "Snippet [1] is always the first snippet found in this session, snippet [2] the second, and so on. "
-                    "If you reference snippet [1] again later, it still refers to that same original snippet. "
-                    "Preserve these stable references even after saving/loading sessions."
+                    "You have a database of snippets and their references on the right panel. "
+                    "You do not need to label or number the snippets in your response text."
                 )
             }
         ]
