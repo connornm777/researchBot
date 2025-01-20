@@ -1,6 +1,6 @@
 import os, pdb
 import json
-import openai
+from openai import OpenAI
 import tiktoken
 from dotenv import load_dotenv
 import numpy as np
@@ -13,6 +13,7 @@ class DataManager:
         # Load environment variables from .env file
         load_dotenv()
         self.api_key = os.getenv('OPENAI_API_KEY')
+        self.client = OpenAI(api_key=self.api_key)
         data_server = os.getenv('DATA_SERVER')
         self.metadata_file = os.path.join(data_server, 'metadata.json')
         self.embedding_file = os.path.join(data_server, 'embeddings.npy')
@@ -22,7 +23,6 @@ class DataManager:
         self.chunk_files_directory = os.path.join(data_server, 'chunks/')
         self.unscannable_pdfs_path = os.path.join(data_server, 'pdfs/unscannable/')
         # Set OpenAI API key
-        openai.api_key = os.getenv('OPENAI_API_KEY')
         # Set models and encoder
         self.tiktoken_model = os.getenv("TIKTOKEN_MODEL")
         self.parsing_model = os.getenv("PARSING_MODEL")
@@ -171,22 +171,20 @@ class DataManager:
     """
 
             try:
-                response = openai.ChatCompletion.create(
-                    model=self.parsing_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a helpful assistant that edits JSON references strictly per user instructions."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    temperature=0
-                )
+                response = self.client.chat.completions.create(model=self.parsing_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that edits JSON references strictly per user instructions."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0)
 
-                cleaned_json_str = response.choices[0].message["content"].strip()
+                cleaned_json_str = response.choices[0].message.content.strip()
 
                 # Parse the GPT output back into a Python dict
                 cleaned_references = json.loads(cleaned_json_str)
@@ -524,23 +522,21 @@ class DataManager:
     """
 
                 # Call the OpenAI API
-                response = openai.ChatCompletion.create(
-                    model=self.parsing_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a helpful assistant that extracts reference information from academic papers."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-                    temperature=0
-                )
+                response = self.client.chat.completions.create(model=self.parsing_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that extracts reference information from academic papers."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0)
 
                 # Parse the assistant's reply
-                assistant_reply = response.choices[0].message["content"]
+                assistant_reply = response.choices[0].message.content
                 references = json.loads(assistant_reply)
 
                 # Update metadata
@@ -652,7 +648,7 @@ class DataManager:
         Returns:
             List[List[float]]: A list of embeddings.
         """
-        response = openai.embeddings.create(
+        response = self.client.embeddings.create(
             input=texts,
             model=self.embedding_model
         )

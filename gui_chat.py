@@ -17,7 +17,6 @@ import openai
 from data_manager import DataManager  # Your DataManager file
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 app_sessions_path = os.path.join(os.getenv("DATA_SERVER"), "app_sessions")
 
 tools = [
@@ -65,7 +64,6 @@ class SnippetDialog(QDialog):
         self.resize(600, 400)
         self.snippet = snippet
 
-
 class InputTextEdit(QTextEdit):
     """A QTextEdit that sends the message on Enter and inserts newline on Shift+Enter."""
     def __init__(self, parent=None):
@@ -82,7 +80,6 @@ class InputTextEdit(QTextEdit):
                 self.parent().parent().send_message()
             return
         super().keyPressEvent(event)
-
 
 class ReferenceChatGUI(QWidget):
     def __init__(self, dm):
@@ -643,7 +640,6 @@ window.MathJax = {
             self.update_right_panel()
             self.set_send_button_pressed(False)
             print(f"Session loaded from {file_path}")
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
