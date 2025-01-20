@@ -12,7 +12,7 @@ class DataManager:
     def __init__(self):
         # Load environment variables from .env file
         load_dotenv()
-        openai.api_key = os.getenv('OPENAI_API_KEY')
+        self.api_key = os.getenv('OPENAI_API_KEY')
         data_server = os.getenv('DATA_SERVER')
         self.metadata_file = os.path.join(data_server, 'metadata.json')
         self.embedding_file = os.path.join(data_server, 'embeddings.npy')
