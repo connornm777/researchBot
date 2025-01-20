@@ -115,6 +115,96 @@ class DataManager:
         else:
             print("No redundant fields found. Metadata is clean.")
 
+    def clean_metadata_references(self):
+        """
+        Uses GPT to clean 'references' in self.metadata for each PDF.
+        - Removes or clears fields containing 'unknown', 'not specified',
+          'self-publishing', or 'draft last modified on' (case-insensitive).
+        - Preserves each PDF's citation_key and type.
+        - Updates metadata.json so future generate_references_bib() calls
+          won't reintroduce the junk fields.
+
+        By design, this does NOT directly edit references.bib. Instead,
+        it modifies the underlying metadata so subsequent steps
+        (generate_references_bib, etc.) produce a clean .bib file.
+        """
+
+        # Track if we made any changes
+        changes_made = False
+
+        for pdf_filename, data in self.metadata.items():
+            references = data.get('references', {})
+            if not references:
+                continue  # No references to clean
+
+            # Convert this PDF's references to a JSON string for GPT
+            # Example references dict might look like:
+            # {
+            #   "type": "article",
+            #   "citation_key": "smith2022",
+            #   "title": "Some Title",
+            #   "note": "Draft last modified on ...",
+            #   "publisher": "unknown"
+            # }
+            references_json = json.dumps(references, indent=2)
+
+            # GPT instruction: remove or empty any fields containing these junk markers.
+            # Keep citation_key and type unchanged. Return valid JSON.
+            prompt = f"""
+    You are given a JSON object representing a single BibTeX-like reference.
+
+    Rules:
+    1. If a field's value contains ANY of these strings (case-insensitive):
+       - "unknown"
+       - "not specified"
+       - "self-publishing"
+       - "draft last modified on"
+       then remove that field entirely (do not rename it, just remove).
+    2. Keep the "citation_key" and "type" fields unchanged, even if they contain these markers.
+    3. Preserve all other fields and their values as-is.
+    4. Return valid JSON (no extra commentary).
+
+    JSON input:
+    \"\"\"
+    {references_json}
+    \"\"\"
+    """
+
+            try:
+                response = openai.ChatCompletion.create(
+                    model=self.parsing_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that edits JSON references strictly per user instructions."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0
+                )
+
+                cleaned_json_str = response.choices[0].message["content"].strip()
+
+                # Parse the GPT output back into a Python dict
+                cleaned_references = json.loads(cleaned_json_str)
+
+                # If the cleaned references differ from the original, update metadata
+                if cleaned_references != references:
+                    data['references'] = cleaned_references
+                    changes_made = True
+
+            except Exception as e:
+                print(f"Error cleaning references for {pdf_filename}: {e}")
+
+        if changes_made:
+            self.save_metadata()
+            print("Cleaned metadata references and saved updated metadata.")
+        else:
+            print("No changes were made to metadata references.")
+
     def process_pdfs(self):
         """
         Processes PDFs listed in the metadata.
@@ -368,11 +458,11 @@ class DataManager:
                 first_chunk_meta = data['chunks'][0]
                 chunk_filename = first_chunk_meta['filename']
                 chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
+
                 with open(chunk_file_path, 'r', encoding='utf-8') as f:
                     first_chunk_text = f.read()
 
                 # Prepare the prompt for GPT
-                # We now ask for 'citation_key' and 'type' fields as well.
                 prompt = f"""
     Extract bibliographic information from the text below and return it as a JSON object that can be directly converted into a valid BibTeX entry.
 
@@ -434,21 +524,23 @@ class DataManager:
     """
 
                 # Call the OpenAI API
-                response = openai.chat.completions.create(
+                response = openai.ChatCompletion.create(
                     model=self.parsing_model,
-                    response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system",
-                         "content": "You are a helpful assistant that extracts reference information from academic papers."},
-                        {"role": "user", "content": prompt}
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that extracts reference information from academic papers."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
                     ],
                     temperature=0
                 )
 
                 # Parse the assistant's reply
-                assistant_reply = response.choices[0].message.content
-
-                # Attempt to parse the assistant's reply as JSON
+                assistant_reply = response.choices[0].message["content"]
                 references = json.loads(assistant_reply)
 
                 # Update metadata
@@ -457,8 +549,47 @@ class DataManager:
                 self.save_metadata()
 
                 print(f"Extracted references for {pdf_filename}.")
+
             except Exception as e:
                 print(f"Error extracting references for {pdf_filename}: {e}")
+
+    def ensure_unique_citation_keys(self):
+        """
+        Ensures each reference entry in metadata has a unique citation_key.
+        If collisions are found, minimally rename subsequent duplicates with
+        a numeric suffix, e.g. 'smith2021' -> 'smith2021-2', etc.
+        """
+        # Collect citation_key usage
+        key_to_pdf_map = {}  # citation_key -> list of pdf_filenames
+        for pdf_filename, data in self.metadata.items():
+            refs = data.get('references', {})
+            ckey = refs.get('citation_key')
+            if ckey:
+                key_to_pdf_map.setdefault(ckey, []).append(pdf_filename)
+
+        # For any citation_key with >1 PDF, rename duplicates
+        all_used_keys = set(key_to_pdf_map.keys())
+        for ckey, pdf_list in key_to_pdf_map.items():
+            if len(pdf_list) > 1:
+                # keep the first as-is, rename subsequent collisions
+                for idx, pdf_filename in enumerate(pdf_list):
+                    if idx == 0:
+                        continue
+                    data = self.metadata[pdf_filename]
+                    refs = data.get('references', {})
+
+                    new_key = ckey
+                    suffix_num = 2
+                    # Generate new keys until unique
+                    while new_key in all_used_keys:
+                        new_key = f"{ckey}-{suffix_num}"
+                        suffix_num += 1
+
+                    refs['citation_key'] = new_key
+                    all_used_keys.add(new_key)
+
+        self.save_metadata()
+        print("Ensured uniqueness of citation keys and saved updated metadata.")
 
     def generate_references_bib(self):
         """
@@ -642,5 +773,9 @@ if __name__ == "__main__":
     dm.chunk_text_files()
     dm.process_embeddings()
     dm.extract_references()
+    dm.ensure_unique_citation_keys()
+    # VVV MAKE A NEW BOOLEAN FOR THIS
+    #dm.clean_metadata_references()
     dm.generate_references_bib()
     dm.remove_problematic_entries()
+
