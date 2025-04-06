@@ -4,8 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment="output better">
+    <list default="true" id="a1fbe47d-abdc-45f5-8797-ef8b185cb470" name="Changes" comment="meta_editor.py">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/data_manager.py" beforeDir="false" afterPath="$PROJECT_DIR$/data_manager.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meta_editor.py" beforeDir="false" afterPath="$PROJECT_DIR$/meta_editor.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -144,7 +146,12 @@
       <workItem from="1741548216017" duration="601000" />
       <workItem from="1741899330519" duration="624000" />
       <workItem from="1742351177684" duration="1037000" />
-      <workItem from="1742826646430" duration="3786000" />
+      <workItem from="1742826646430" duration="4066000" />
+      <workItem from="1742947987384" duration="616000" />
+      <workItem from="1743018788616" duration="1020000" />
+      <workItem from="1743110951948" duration="599000" />
+      <workItem from="1743193160163" duration="601000" />
+      <workItem from="1743964299522" duration="3526000" />
     </task>
     <task id="LOCAL-00001" summary="test">
       <option name="closed" value="true" />
@@ -346,7 +353,15 @@
       <option name="project" value="LOCAL" />
       <updated>1737403060765</updated>
     </task>
-    <option name="localTasksCounter" value="26" />
+    <task id="LOCAL-00026" summary="meta_editor.py">
+      <option name="closed" value="true" />
+      <created>1742873072886</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1742873072886</updated>
+    </task>
+    <option name="localTasksCounter" value="27" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -371,6 +386,7 @@
     <MESSAGE value="woah" />
     <MESSAGE value="-_-" />
     <MESSAGE value="output better" />
-    <option name="LAST_COMMIT_MESSAGE" value="output better" />
+    <MESSAGE value="meta_editor.py" />
+    <option name="LAST_COMMIT_MESSAGE" value="meta_editor.py" />
   </component>
 </project>

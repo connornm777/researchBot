@@ -762,6 +762,102 @@ class DataManager:
                     break  # Found the PDF
         return results
 
+    def remove_pdf_entry(self, pdf_filename):
+        """
+        Removes a PDF entry from metadata, moves the PDF file to unscannable,
+        removes associated text/chunk files, removes embeddings from self.embeddings,
+        and reindexes everything. Finally, saves updated metadata and embeddings.
+        """
+        data = self.metadata.pop(pdf_filename, None)
+        if not data:
+            print(f"No metadata found for {pdf_filename}. Nothing to remove.")
+            return
+
+        # 1) Move the PDF file to unscannable/ if it exists
+        pdf_path = os.path.join(self.pdf_files_directory, pdf_filename)
+        unscannable_path = os.path.join(self.unscannable_pdfs_path, pdf_filename)
+        if os.path.exists(pdf_path):
+            try:
+                os.replace(pdf_path, unscannable_path)
+                print(f"Moved {pdf_filename} to {unscannable_path}.")
+            except Exception as e:
+                print(f"Error moving {pdf_filename} to unscannable: {e}")
+
+        # 2) Remove the text file if it exists
+        text_filename = data.get("text_filename", "")
+        if text_filename:
+            text_path = os.path.join(self.text_files_directory, text_filename)
+            if os.path.exists(text_path):
+                try:
+                    os.remove(text_path)
+                    print(f"Removed text file {text_path}.")
+                except Exception as e:
+                    print(f"Error removing text file {text_path}: {e}")
+
+        # 3) Remove chunk files and track their embedding indexes
+        embedding_indexes_to_remove = []
+        chunks = data.get("chunks", [])
+        for chunk_meta in chunks:
+            chunk_file = chunk_meta.get("filename")
+            if chunk_file:
+                chunk_path = os.path.join(self.chunk_files_directory, chunk_file)
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                        print(f"Removed chunk file {chunk_path}.")
+                    except Exception as e:
+                        print(f"Error removing chunk file {chunk_path}: {e}")
+
+            # Collect embedding index so we can remove from self.embeddings
+            idx = chunk_meta.get("embedding_index")
+            if isinstance(idx, int):
+                embedding_indexes_to_remove.append(idx)
+
+        if not len(embedding_indexes_to_remove):
+            # Save updated metadata (PDF is removed) and we're done
+            self.save_metadata()
+            print(f"No embeddings to remove for {pdf_filename}. Done.")
+            return
+
+        embedding_indexes_to_remove.sort()
+
+        # 4) Create a mask for embeddings to keep
+        old_count = len(self.embeddings)
+        keep_mask = np.ones(old_count, dtype=bool)
+        for idx in embedding_indexes_to_remove:
+            if 0 <= idx < old_count:
+                keep_mask[idx] = False
+
+        new_embeddings = self.embeddings[keep_mask]
+
+        # 5) Build an old->new index map
+        old_to_new = [None] * old_count
+        new_index = 0
+        for i in range(old_count):
+            if keep_mask[i]:
+                old_to_new[i] = new_index
+                new_index += 1
+
+        # Now update embedding_index references in the remaining PDFs
+        for other_pdf, other_data in self.metadata.items():
+            for ch in other_data.get("chunks", []):
+                idx = ch.get("embedding_index")
+                if isinstance(idx, int) and idx < old_count:
+                    new_idx = old_to_new[idx]
+                    if new_idx is None:
+                        ch["embedding_index"] = None
+                    else:
+                        ch["embedding_index"] = new_idx
+
+        # 6) Assign the new embeddings array
+        self.embeddings = new_embeddings
+
+        # 7) Save everything
+        self.save_metadata()
+        self.save_embeddings()
+        print(f"Removed {pdf_filename} from metadata, reindexed embeddings, and saved changes.")
+
+
 if __name__ == "__main__":
     dm = DataManager()
     dm.update_metadata()
