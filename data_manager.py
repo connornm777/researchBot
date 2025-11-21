@@ -1,101 +1,205 @@
-import os, pdb
+import os
 import json
+from pathlib import Path
+from typing import Dict, List, Any, Tuple, Optional
+
+from dotenv import load_dotenv
 from openai import OpenAI
 import tiktoken
-from dotenv import load_dotenv
 import numpy as np
 from pdfminer.high_level import extract_text
-from PyPDF2 import PdfReader
+
 
 class DataManager:
+    """
+    Central manager for:
+      - metadata.json (per-PDF state, chunks, references)
+      - embeddings.npy (vector store)
+      - references.bib (BibTeX export)
 
-    def __init__(self):
-        # Load environment variables from .env file
+    This is compatible with your existing data:
+      - It reads the current metadata.json and embeddings.npy.
+      - It uses existing 'chunks' entries and their 'embedding_index'.
+      - It only changes embeddings when you call process_embeddings().
+
+    Typical ingestion pipeline:
+
+        dm = DataManager()
+        dm.update_metadata()
+        dm.process_pdfs()
+        dm.chunk_text_files()
+        dm.process_embeddings()
+        dm.extract_references()
+        dm.ensure_unique_citation_keys()
+        dm.clean_metadata()
+        dm.clean_metadata_references()
+        dm.generate_references_bib()
+    """
+
+    # ------------------------------------------------------------------
+    # init / paths / config
+    # ------------------------------------------------------------------
+
+    def __init__(self, data_server: Optional[str] = None) -> None:
         load_dotenv()
-        self.api_key = os.getenv('OPENAI_API_KEY')
+
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY not set in environment.")
         self.client = OpenAI(api_key=self.api_key)
-        data_server = os.getenv('DATA_SERVER')
-        self.metadata_file = os.path.join(data_server, 'metadata.json')
-        self.embedding_file = os.path.join(data_server, 'embeddings.npy')
-        self.reference_file = os.path.join(data_server, 'references.bib')
-        self.pdf_files_directory = os.path.join(data_server, 'pdfs/')
-        self.text_files_directory = os.path.join(data_server, 'text/')
-        self.chunk_files_directory = os.path.join(data_server, 'chunks/')
-        self.unscannable_pdfs_path = os.path.join(data_server, 'pdfs/unscannable/')
-        # Set OpenAI API key
-        # Set models and encoder
-        self.tiktoken_model = os.getenv("TIKTOKEN_MODEL")
-        self.parsing_model = os.getenv("PARSING_MODEL")
-        self.embedding_model = os.getenv("EMBEDDING_MODEL")
+
+        root = data_server or os.getenv("DATA_SERVER") or "."
+        self.data_server = Path(root).expanduser()
+
+        # core files
+        self.metadata_file = self.data_server / "metadata.json"
+        self.embedding_file = self.data_server / "embeddings.npy"
+        self.reference_file = self.data_server / "references.bib"
+
+        # directories
+        self.pdf_files_directory = self.data_server / "pdfs"
+        self.text_files_directory = self.data_server / "text"
+        self.chunk_files_directory = self.data_server / "chunks"
+        self.unscannable_pdfs_path = self.pdf_files_directory / "unscannable"
+
+        for d in (
+            self.pdf_files_directory,
+            self.text_files_directory,
+            self.chunk_files_directory,
+            self.unscannable_pdfs_path,
+        ):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # models / tokenizer
+        self.tiktoken_model = os.getenv("TIKTOKEN_MODEL", "gpt-4o-mini")
+        self.parsing_model = os.getenv("PARSING_MODEL", "gpt-4o-mini")
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+
         self.encoder = tiktoken.encoding_for_model(self.tiktoken_model)
-        # Convert parameters to appropriate types
-        self.max_tokens_per_chunk = int(os.getenv('MAX_TOKENS_PER_CHUNK'))
-        self.overlap_tokens = int(os.getenv('OVERLAP_TOKENS'))
-        # Batch size (adjust as appropriate)
-        self.batch_size = int(8000 / self.max_tokens_per_chunk)
-        # Initialize metadata and embeddings
-        self.metadata = self.load_metadata()
-        self.embeddings = self.load_embeddings()
 
-    def token_count(self, text):
-        return len(self.encoder.encode(text))
+        # chunking config
+        self.max_tokens_per_chunk = int(os.getenv("MAX_TOKENS_PER_CHUNK", "800"))
+        self.overlap_tokens = int(os.getenv("OVERLAP_TOKENS", "80"))
 
-    def load_metadata(self):
-        if os.path.exists(self.metadata_file):
-            with open(self.metadata_file, 'r') as f:
-                return json.load(f)
-        else:
-            return {}
+        # batch size for embeddings (approx tokens_per_batch / tokens_per_chunk)
+        batch_tokens = int(os.getenv("EMBEDDING_BATCH_TOKENS", "8000"))
+        self.batch_size = max(1, batch_tokens // max(self.max_tokens_per_chunk, 1))
 
-    def save_metadata(self):
-        with open(self.metadata_file, 'w') as f:
-            json.dump(self.metadata, f, indent=4)
+        # core state
+        self.metadata: Dict[str, dict] = self.load_metadata()
+        self.embeddings: np.ndarray = self.load_embeddings()
 
-    def load_embeddings(self):
-        if os.path.exists(self.embedding_file):
-            embeddings = np.load(self.embedding_file)
-            return embeddings
-        else:
-            return np.array([])
+        # index: embedding_index -> (pdf_filename, chunk_idx)
+        self.embedding_index: Dict[int, Tuple[str, int]] = {}
+        self._build_embedding_index()
 
-    def save_embeddings(self):
+    # ------------------------------------------------------------------
+    # basic helpers
+    # ------------------------------------------------------------------
+
+    def _log(self, *args: Any) -> None:
+        print("[DataManager]", *args)
+
+    def token_count(self, text: str) -> int:
+        return len(self.encoder.encode(text or ""))
+
+    # ------------------------------------------------------------------
+    # metadata / embeddings I/O
+    # ------------------------------------------------------------------
+
+    def load_metadata(self) -> Dict[str, dict]:
+        if self.metadata_file.exists():
+            try:
+                with self.metadata_file.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                self._log("Warning: failed to load metadata.json:", e)
+        return {}
+
+    def save_metadata(self) -> None:
+        try:
+            with self.metadata_file.open("w", encoding="utf-8") as f:
+                json.dump(self.metadata, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self._log("Error saving metadata.json:", e)
+
+    def load_embeddings(self) -> np.ndarray:
+        if self.embedding_file.exists():
+            try:
+                return np.load(self.embedding_file)
+            except Exception as e:
+                self._log("Warning: failed to load embeddings.npy:", e)
+        return np.array([], dtype=np.float32)
+
+    def save_embeddings(self) -> None:
         np.save(self.embedding_file, self.embeddings)
 
-    def update_metadata(self):
+    # ------------------------------------------------------------------
+    # embedding index
+    # ------------------------------------------------------------------
+
+    def _build_embedding_index(self) -> None:
         """
-        Updates the metadata by adding any new PDFs found in the PDF_PATH directory.
-        Only PDFs listed in the metadata will be processed by other functions.
+        Build lookup: embedding_index -> (pdf_filename, chunk_idx).
+
+        Uses existing 'embedding_index' integers from metadata['chunks'].
         """
-        pdf_files = [f for f in os.listdir(self.pdf_files_directory) if f.endswith('.pdf')]
+        self.embedding_index.clear()
+        for pdf_filename, data in self.metadata.items():
+            chunks = data.get("chunks") or []
+            for chunk_idx, chunk_meta in enumerate(chunks):
+                idx = chunk_meta.get("embedding_index")
+                if isinstance(idx, int):
+                    self.embedding_index[idx] = (pdf_filename, chunk_idx)
+
+    # ------------------------------------------------------------------
+    # metadata sync / cleaning
+    # ------------------------------------------------------------------
+
+    def update_metadata(self) -> None:
+        """
+        Discover new PDFs under pdfs/ and add skeleton entries to metadata.
+
+        Does not remove existing entries.
+        """
+        pdf_files = [
+            f for f in os.listdir(self.pdf_files_directory)
+            if f.lower().endswith(".pdf")
+        ]
         new_pdfs_found = False
 
         for pdf_filename in pdf_files:
             if pdf_filename not in self.metadata:
-                # Initialize metadata for new PDF
                 self.metadata[pdf_filename] = {
-                    'converted_to_text': False,
-                    'text_filename': '',
-                    'chunked': False,
-                    'chunks': [],
-                    'references': {},  # Open-ended sub-dictionary for reference info
-                    'references_extracted': False,
-                    # Other processing flags can be added as needed
+                    "converted_to_text": False,
+                    "text_filename": "",
+                    "chunked": False,
+                    "chunks": [],
+                    "references": {},
+                    "references_extracted": False,
                 }
-                print(f"Added new PDF to metadata: {pdf_filename}")
+                self._log("Added new PDF to metadata:", pdf_filename)
                 new_pdfs_found = True
 
         if new_pdfs_found:
             self.save_metadata()
-            print("Metadata updated with new PDFs.")
+            self._log("Metadata updated with new PDFs.")
         else:
-            print("No new PDFs found.")
+            self._log("No new PDFs found.")
 
-    def clean_metadata(self):
+    def clean_metadata(self) -> None:
         """
-        Removes redundant author, title, and affiliations data not under the 'references'
-        sub-dictionary in the metadata.
+        Remove legacy top-level fields now redundant with 'references'.
         """
-        fields_to_remove = ['title', 'authors', 'affiliations', 'embedded', 'metadata_extracted']
+        fields_to_remove = [
+            "title",
+            "authors",
+            "affiliations",
+            "embedded",
+            "metadata_extracted",
+        ]
         modified = False
 
         for pdf_filename, data in self.metadata.items():
@@ -103,771 +207,607 @@ class DataManager:
                 if field in data:
                     del data[field]
                     modified = True
-                    print(f"Removed '{field}' from metadata of {pdf_filename}")
-            # Ensure 'references' sub-dictionary exists
-            if 'references' not in data:
-                data['references'] = {}
+                    self._log(f"Removed '{field}' from metadata of {pdf_filename}")
+            if "references" not in data:
+                data["references"] = {}
                 modified = True
 
         if modified:
             self.save_metadata()
-            print("Metadata cleaned and saved.")
+            self._log("Metadata cleaned and saved.")
         else:
-            print("No redundant fields found. Metadata is clean.")
+            self._log("Metadata already clean.")
 
-    def clean_metadata_references(self):
+    def clean_metadata_references(self) -> None:
         """
-        Uses GPT to clean 'references' in self.metadata for each PDF.
-        - Removes or clears fields containing 'unknown', 'not specified',
-          'self-publishing', or 'draft last modified on' (case-insensitive).
-        - Preserves each PDF's citation_key and type.
-        - Updates metadata.json so future generate_references_bib() calls
-          won't reintroduce the junk fields.
-
-        By design, this does NOT directly edit references.bib. Instead,
-        it modifies the underlying metadata so subsequent steps
-        (generate_references_bib, etc.) produce a clean .bib file.
+        Cheap deterministic cleanup of obvious junk from 'references'.
         """
-
-        # Track if we made any changes
+        junk_markers = (
+            "unknown",
+            "not specified",
+            "self-publishing",
+            "draft last modified on",
+        )
         changes_made = False
 
         for pdf_filename, data in self.metadata.items():
-            references = data.get('references', {})
-            if not references:
-                continue  # No references to clean
+            refs = data.get("references") or {}
+            if not isinstance(refs, dict):
+                continue
 
-            # Convert this PDF's references to a JSON string for GPT
-            # Example references dict might look like:
-            # {
-            #   "type": "article",
-            #   "citation_key": "smith2022",
-            #   "title": "Some Title",
-            #   "note": "Draft last modified on ...",
-            #   "publisher": "unknown"
-            # }
-            references_json = json.dumps(references, indent=2)
-
-            # GPT instruction: remove or empty any fields containing these junk markers.
-            # Keep citation_key and type unchanged. Return valid JSON.
-            prompt = f"""
-    You are given a JSON object representing a single BibTeX-like reference.
-
-    Rules:
-    1. If a field's value contains ANY of these strings (case-insensitive):
-       - "unknown"
-       - "not specified"
-       - "self-publishing"
-       - "draft last modified on"
-       then remove that field entirely (do not rename it, just remove).
-    2. Keep the "citation_key" and "type" fields unchanged, even if they contain these markers.
-    3. Preserve all other fields and their values as-is.
-    4. Return valid JSON (no extra commentary).
-
-    JSON input:
-    \"\"\"
-    {references_json}
-    \"\"\"
-    """
-
-            try:
-                response = self.client.chat.completions.create(model=self.parsing_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that edits JSON references strictly per user instructions."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0)
-
-                cleaned_json_str = response.choices[0].message.content.strip()
-
-                # Parse the GPT output back into a Python dict
-                cleaned_references = json.loads(cleaned_json_str)
-
-                # If the cleaned references differ from the original, update metadata
-                if cleaned_references != references:
-                    data['references'] = cleaned_references
+            for key in list(refs.keys()):
+                if key in ("type", "citation_key"):
+                    continue
+                value = refs.get(key)
+                if not value:
+                    continue
+                s = str(value).lower()
+                if any(m in s for m in junk_markers):
+                    del refs[key]
                     changes_made = True
-
-            except Exception as e:
-                print(f"Error cleaning references for {pdf_filename}: {e}")
+                    self._log(
+                        f"Removed junk field '{key}' from references of {pdf_filename}"
+                    )
 
         if changes_made:
             self.save_metadata()
-            print("Cleaned metadata references and saved updated metadata.")
+            self._log("Cleaned metadata references and saved.")
         else:
-            print("No changes were made to metadata references.")
+            self._log("No junk fields found in references.")
 
-    def process_pdfs(self):
+    # ------------------------------------------------------------------
+    # PDF -> text
+    # ------------------------------------------------------------------
+
+    def convert_pdf_to_text(self, pdf_filename: str) -> str:
         """
-        Processes PDFs listed in the metadata.
-        Only PDFs that are in the metadata will be processed.
+        Convert a PDF to plain text and return the text filename.
         """
-        for pdf_filename in self.metadata:
-            if self.metadata[pdf_filename]['converted_to_text']:
+        pdf_path = self.pdf_files_directory / pdf_filename
+        text_filename = f"{Path(pdf_filename).stem}.txt"
+        text_path = self.text_files_directory / text_filename
+
+        self.text_files_directory.mkdir(parents=True, exist_ok=True)
+
+        text = extract_text(str(pdf_path))
+        with text_path.open("w", encoding="utf-8") as f:
+            f.write(text)
+
+        return text_filename
+
+    def process_pdfs(self) -> None:
+        """
+        Convert any PDFs that haven't yet been converted to text.
+        """
+        changed = False
+        for pdf_filename, data in self.metadata.items():
+            if data.get("converted_to_text"):
                 continue
-
-            # Convert PDF to text
             try:
                 text_filename = self.convert_pdf_to_text(pdf_filename)
-                self.metadata[pdf_filename]['converted_to_text'] = True
-                self.metadata[pdf_filename]['text_filename'] = text_filename
-                self.save_metadata()
-                print(f"Converted {pdf_filename} to text.")
+                data["converted_to_text"] = True
+                data["text_filename"] = text_filename
+                changed = True
+                self._log(f"Converted {pdf_filename} -> {text_filename}")
             except Exception as e:
-                print(f"Error converting {pdf_filename} to text: {e}")
+                self._log(f"Error converting {pdf_filename}:", e)
 
-    def convert_pdf_to_text(self, pdf_filename):
-        pdf_path = os.path.join(self.pdf_files_directory, pdf_filename)
-        text_filename = os.path.splitext(pdf_filename)[0] + '.txt'
-        text_path = os.path.join(self.text_files_directory, text_filename)
+        if changed:
+            self.save_metadata()
 
-        os.makedirs(self.text_files_directory, exist_ok=True)
+    # ------------------------------------------------------------------
+    # text -> chunks
+    # ------------------------------------------------------------------
 
-        text = extract_text(pdf_path)
-        with open(text_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        return text_filename  # Return the name of the text file created
-
-    def chunk_text(self, text, max_tokens=2000, overlap=50):
+    def chunk_text(self, text: str, max_tokens: int, overlap: int) -> List[str]:
         """
-        Splits a string into chunks with overlap, each containing up to max_tokens tokens.
-
-        Args:
-            text (str): The input text string to be chunked.
-            max_tokens (int): The maximum number of tokens per chunk.
-            overlap (int): The number of tokens to overlap between chunks.
-
-        Returns:
-            List[str]: A list of text chunks.
+        Split text into overlapping chunks in token space.
         """
-        tokens = self.encoder.encode(text)
-        chunks = []
+        tokens = self.encoder.encode(text or "")
+        chunks: List[str] = []
+        n = len(tokens)
         start = 0
-        while start < len(tokens):
-            end = start + max_tokens
+
+        while start < n:
+            end = min(n, start + max_tokens)
             chunk_tokens = tokens[start:end]
             chunk_text = self.encoder.decode(chunk_tokens)
             chunks.append(chunk_text)
-            start += max_tokens - overlap  # Move the start position forward with overlap
+            if end == n:
+                break
+            start = max(0, end - overlap)
+
         return chunks
 
-    def chunk_text_files(self):
+    def chunk_text_files(self) -> None:
         """
-        Processes text files listed in the metadata, creates chunk files with overlap,
-        and updates the metadata accordingly.
-
-        Only processes text files that have not been chunked yet.
+        Create chunk files for each converted text file that hasn't been chunked yet.
         """
+        changed = False
         for pdf_filename, data in self.metadata.items():
-            if not data.get('converted_to_text'):
+            if not data.get("converted_to_text"):
+                continue
+            if data.get("chunked"):
                 continue
 
-            if data.get('chunked'):
+            text_filename = data.get("text_filename")
+            if not text_filename:
                 continue
 
-            text_filename = data['text_filename']
-            text_path = os.path.join(self.text_files_directory, text_filename)
-            base_filename = os.path.splitext(text_filename)[0]
-            os.makedirs(self.chunk_files_directory, exist_ok=True)
+            text_path = self.text_files_directory / text_filename
+            if not text_path.exists():
+                self._log(f"Text file missing for {pdf_filename}: {text_path}")
+                continue
 
             try:
-                with open(text_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
+                with text_path.open("r", encoding="utf-8") as f:
+                    full_text = f.read()
+            except Exception as e:
+                self._log(f"Error reading {text_path}:", e)
+                continue
 
-                # Use chunk_text to get the chunks
-                chunks = self.chunk_text(
-                    text,
-                    max_tokens=self.max_tokens_per_chunk,
-                    overlap=self.overlap_tokens
+            chunks = self.chunk_text(
+                full_text,
+                max_tokens=self.max_tokens_per_chunk,
+                overlap=self.overlap_tokens,
+            )
+
+            base = Path(text_filename).stem
+            self.chunk_files_directory.mkdir(parents=True, exist_ok=True)
+
+            num_digits = len(str(max(len(chunks), 1)))
+            chunk_metadata_list: List[dict] = []
+
+            for idx, chunk in enumerate(chunks):
+                chunk_filename = f"{base}_chunk{str(idx).zfill(num_digits)}.txt"
+                chunk_path = self.chunk_files_directory / chunk_filename
+                with chunk_path.open("w", encoding="utf-8") as f:
+                    f.write(chunk)
+                chunk_metadata_list.append(
+                    {"filename": chunk_filename, "embedding_index": None}
                 )
 
-                # Write chunks to disk with appropriate padding
-                num_digits = len(str(len(chunks)))
-                chunk_metadata_list = []
-                for idx, chunk in enumerate(chunks):
-                    chunk_filename = f"{base_filename}_chunk{str(idx).zfill(num_digits)}.txt"
-                    chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
-                    with open(chunk_file_path, 'w', encoding='utf-8') as f:
-                        f.write(chunk)
-                    chunk_metadata = {
-                        'filename': chunk_filename,
-                        'embedding_index': None
-                    }
-                    chunk_metadata_list.append(chunk_metadata)
+            data["chunked"] = True
+            data["chunks"] = chunk_metadata_list
+            changed = True
+            self._log(f"Chunked {pdf_filename} into {len(chunks)} chunks.")
 
-                # Update metadata
-                data['chunked'] = True
-                data['chunks'] = chunk_metadata_list
-                self.save_metadata()
+        if changed:
+            self.save_metadata()
 
-                print(f"Chunked text for {pdf_filename} into {len(chunks)} chunks.")
-            except Exception as e:
-                print(f"Error chunking text for {pdf_filename}: {e}")
+    # ------------------------------------------------------------------
+    # embeddings
+    # ------------------------------------------------------------------
 
-    def remove_problematic_entries(self):
+    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
-        Identify and remove problematic entries from metadata and embeddings.
-        For example, entries with empty titles.
-        This function:
-        - Finds entries with empty (or invalid) titles.
-        - Asks the user to confirm deletion.
-        - Removes those entries and their associated embeddings from self.embeddings.
-        - Reindexes embedding indexes for all remaining entries.
+        Wrapper around OpenAI embeddings API.
         """
+        resp = self.client.embeddings.create(
+            model=self.embedding_model,
+            input=texts,
+        )
+        return [row.embedding for row in resp.data]
 
-        # Identify problematic PDFs (for example, those with empty titles)
-        # You can adjust this condition as needed
-        problematic_pdfs = []
+    def process_embeddings(self) -> None:
+        """
+        Generate embeddings for any chunks whose 'embedding_index' is None.
+
+        Appends to existing embeddings.npy, preserving all prior vectors.
+        """
+        missing: List[Tuple[str, int, str]] = []
         for pdf_filename, data in self.metadata.items():
-            references = data.get('references', {})
-            title = references.get('title', '').strip()
-            # Condition: empty title or no title field
-            if title == '':
-                problematic_pdfs.append(pdf_filename)
-
-        if not problematic_pdfs:
-            print("No problematic entries found (e.g., no empty titles).")
-            return
-
-        # Ask for confirmation to remove each problematic PDF
-        to_remove = []
-        for pdf_filename in problematic_pdfs:
-            answer = input(
-                f"Found problematic entry: {pdf_filename} has empty title. Remove it? (y/n): ").strip().lower()
-            if answer == 'y':
-                to_remove.append(pdf_filename)
-            else:
-                print(f"Skipping removal of {pdf_filename}.")
-
-        if not to_remove:
-            print("No entries selected for removal.")
-            return
-
-        # Gather all embeddings to remove
-        # We'll collect all embedding indexes from each PDF we're removing
-        embedding_indexes_to_remove = []
-        for pdf_filename in to_remove:
-            if self.metadata[pdf_filename]['converted_to_text']:
-                os.remove(os.path.join(self.text_files_directory, self.metadata[pdf_filename]['text_filename']))
-            os.replace(os.path.join(self.pdf_files_directory, pdf_filename), os.path.join(self.unscannable_pdfs_path, pdf_filename))
-            data = self.metadata[pdf_filename]
-            # Collect all embedding indexes from the chunks
-            chunks = data.get('chunks', [])
-            for chunk_meta in chunks:
-                idx = chunk_meta.get('embedding_index')
-                if idx is not None:
-                    embedding_indexes_to_remove.append(idx)
-
-        if not embedding_indexes_to_remove and not to_remove:
-            # Nothing to remove
-            print("No embeddings or entries to remove.")
-            return
-
-        # Sort embedding indexes to remove
-        embedding_indexes_to_remove.sort()
-
-        # Create a mask for embeddings we want to keep
-        old_count = len(self.embeddings)
-        keep_mask = np.ones(old_count, dtype=bool)
-        for idx in embedding_indexes_to_remove:
-            if 0 <= idx < old_count:
-                keep_mask[idx] = False
-
-        # Filter embeddings
-        new_embeddings = self.embeddings[keep_mask]
-
-        # Now we need to update embedding_index references in metadata
-        # Create a mapping from old indexes to new indexes
-        old_to_new = [None] * old_count
-        new_index = 0
-        for i in range(old_count):
-            if keep_mask[i]:
-                old_to_new[i] = new_index
-                new_index += 1
-
-        # Remove the PDFs from metadata and fix embedding indexes in remaining entries
-        for pdf_filename in to_remove:
-            del self.metadata[pdf_filename]
-
-        # Update all embedding indexes in remaining metadata
-        for pdf_filename, data in self.metadata.items():
-            chunks = data.get('chunks', [])
-            for chunk_meta in chunks:
-                idx = chunk_meta.get('embedding_index', None)
-                if idx is not None and idx < old_count:
-                    new_idx = old_to_new[idx]
-                    # If this embedding was removed, new_idx would be None, but that
-                    # should not happen for chunks we keep. Just in case:
-                    if new_idx is None:
-                        # This chunk lost its embedding, handle as needed or set to None
-                        chunk_meta['embedding_index'] = None
-                    else:
-                        chunk_meta['embedding_index'] = new_idx
-
-        # Assign updated embeddings back to self.embeddings
-        self.embeddings = new_embeddings
-        self.save_embeddings()
-        self.save_metadata()
-        print("Removed selected entries and reorganized embeddings and metadata indexes.")
-
-    def clear_references(self):
-        """
-        Clears old references from the metadata, resets the 'references_extracted' flag,
-        and optionally removes the existing references.bib file.
-        """
-        # Iterate over all PDFs in the metadata
-        for pdf_filename, data in self.metadata.items():
-            # Clear references
-            data['references'] = {}
-            # Reset the flag so that extract_references can run again
-            data['references_extracted'] = False
-
-        # Save updated metadata
-        self.save_metadata()
-        print("Cleared old references in metadata and reset 'references_extracted' flags.")
-
-        # Optionally remove the existing references.bib file if you want a fresh start
-        # Comment this out if you prefer to keep the old file
-        if os.path.exists(self.reference_file):
-            os.remove(self.reference_file)
-            print(f"Removed old {self.reference_file} file.")
-
-    def extract_references(self):
-        """
-        Uses GPT to extract reference information from the first chunk
-        of each text file, and updates the metadata under the 'references' field.
-        Also requests the model to provide a suitable citation key and item type.
-        """
-        for pdf_filename, data in self.metadata.items():
-            if not data.get('chunked'):
+            if not data.get("chunked"):
                 continue
+            chunks = data.get("chunks") or []
+            for chunk_idx, chunk_meta in enumerate(chunks):
+                if isinstance(chunk_meta.get("embedding_index"), int):
+                    continue
+                chunk_filename = chunk_meta.get("filename")
+                if not chunk_filename:
+                    continue
+                chunk_path = self.chunk_files_directory / chunk_filename
+                try:
+                    with chunk_path.open("r", encoding="utf-8") as f:
+                        text = f.read()
+                    missing.append((pdf_filename, chunk_idx, text))
+                except Exception as e:
+                    self._log(f"Error reading chunk {chunk_filename}:", e)
 
-            if data.get('references_extracted'):
-                continue
+        if not missing:
+            self._log("No new chunks to embed.")
+            return
+
+        total = len(missing)
+        self._log(f"Embedding {total} chunks (batch_size={self.batch_size})...")
+
+        for i in range(0, total, self.batch_size):
+            batch = missing[i : i + self.batch_size]
+            batch_texts = [x[2] for x in batch]
 
             try:
-                # Get the first chunk metadata
-                first_chunk_meta = data['chunks'][0]
-                chunk_filename = first_chunk_meta['filename']
-                chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
+                batch_embeddings = np.array(
+                    self.generate_embeddings(batch_texts),
+                    dtype=np.float32,
+                )
+            except Exception as e:
+                self._log(f"Error generating embeddings for batch {i}:", e)
+                continue
 
-                with open(chunk_file_path, 'r', encoding='utf-8') as f:
-                    first_chunk_text = f.read()
+            start_index = int(len(self.embeddings))
+            if self.embeddings.size == 0:
+                self.embeddings = batch_embeddings
+            else:
+                self.embeddings = np.vstack([self.embeddings, batch_embeddings])
 
-                # Prepare the prompt for GPT
-                prompt = f"""
-    Extract bibliographic information from the text below and return it as a JSON object that can be directly converted into a valid BibTeX entry.
+            for j, (pdf_filename, chunk_idx, _text) in enumerate(batch):
+                embedding_index = start_index + j
+                chunk_meta = self.metadata[pdf_filename]["chunks"][chunk_idx]
+                chunk_meta["embedding_index"] = embedding_index
 
-    Fields to use if present:
-    - title
-    - author (as a list of strings, each "FirstName LastName")
-    - journal
-    - year
-    - volume
-    - number
-    - pages
-    - publisher
-    - address
-    - note
-    - doi
-    - url
+        self.save_embeddings()
+        self.save_metadata()
+        self._build_embedding_index()
 
-    If an author uses an equation in the title, make sure you use $ to enclose it so it compiles in latex.
+    # ------------------------------------------------------------------
+    # reference extraction / BibTeX
+    # ------------------------------------------------------------------
 
-    All values must be strings. If a field is unknown, omit it. Don't write 'none' or 'not specified'. Do not include any fields not listed above.
+    def extract_references(self) -> None:
+        """
+        Use the first chunk of each paper to extract a reference entry and
+        store it under metadata[pdf]['references'].
+        """
+        changed = False
 
-    Additionally, determine the appropriate BibTeX item type:
-    - If 'journal' is present, use "article".
-    - If 'publisher' and 'address' are present and no 'journal', use "book".
-    - Otherwise, use "misc".
+        for pdf_filename, data in self.metadata.items():
+            if not data.get("chunked"):
+                continue
+            if data.get("references_extracted"):
+                continue
 
-    Return a 'type' field indicating the chosen item type.
+            chunks = data.get("chunks") or []
+            if not chunks:
+                continue
 
-    Also, generate a 'citation_key' field that is:
-    - all lowercase
-    - no special characters or spaces
-    - as short as possible but still unique
-    - derive it from the first author's last name (if available), the year (if available), and a distinctive short portion of the title (if available)
-    - If any of these are missing, just do your best to create a short stable key.
+            first_chunk_filename = chunks[0].get("filename")
+            if not first_chunk_filename:
+                continue
 
-    Return only these fields and do not include commentary or additional text outside the JSON.
+            chunk_path = self.chunk_files_directory / first_chunk_filename
+            try:
+                with chunk_path.open("r", encoding="utf-8") as f:
+                    chunk_text = f.read()
+            except Exception as e:
+                self._log(f"Error reading first chunk for {pdf_filename}:", e)
+                continue
 
-    Example JSON:
-    {{
-      "type": "article",
-      "citation_key": "hallwightman1957",
-      "title": "A Theorem on Invariant Analytic Functions with Applications to Relativistic Quantum Field Theory",
-      "author": ["D. Hall", "A. S. Wightman"],
-      "journal": "Matematisk-fysiske Meddelelser",
-      "volume": "31",
-      "number": "5",
-      "year": "1957",
-      "publisher": "Det Kongelige Danske Videnskabernes Selskab",
-      "address": "Copenhagen",
-      "note": "In commission at Ejnar Munksgaard"
-    }}
+            system_msg = (
+                "You are a bibliographic extraction assistant. "
+                "Given the beginning of a scientific paper, you must output a single "
+                "JSON object describing one BibTeX-like entry for that paper. "
+                "Use fields: type, citation_key, title, author, year, journal, "
+                "booktitle, publisher, volume, number, pages, doi, url. "
+                "If something is unknown, use an empty string. "
+                "The 'author' field should follow BibTeX style "
+                "'Last, First and SecondLast, SecondFirst ...'. "
+                "The citation_key should be a short identifier like "
+                "lastnameYearShortTitle (no spaces). "
+                "Respond with JSON only."
+            )
 
-    If a field is numeric, convert it to a string. Authors must be strings in a list. If multiple authors, separate them into multiple items. The JSON must be strictly parseable with Python's json.loads().
+            user_msg = (
+                f"PDF filename: {pdf_filename}\n\n"
+                f"First chunk of text:\n\n{chunk_text[:6000]}"
+            )
 
-    Text:
-    \"\"\"
-    {first_chunk_text}
-    \"\"\"
-    """
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.parsing_model,
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+                content = resp.choices[0].message.content or "{}"
+                ref_data = json.loads(content)
 
-                # Call the OpenAI API
-                response = self.client.chat.completions.create(model=self.parsing_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that extracts reference information from academic papers."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0)
+                if not isinstance(ref_data, dict):
+                    self._log(f"Non-dict references for {pdf_filename}, skipping.")
+                    continue
 
-                # Parse the assistant's reply
-                assistant_reply = response.choices[0].message.content
-                references = json.loads(assistant_reply)
+                ref_data.setdefault("type", "misc")
+                if not ref_data.get("citation_key"):
+                    stem = Path(pdf_filename).stem.replace(" ", "_")
+                    ref_data["citation_key"] = stem
 
-                # Update metadata
-                data['references'].update(references)
-                data['references_extracted'] = True
-                self.save_metadata()
-
-                print(f"Extracted references for {pdf_filename}.")
+                data["references"] = ref_data
+                data["references_extracted"] = True
+                changed = True
+                self._log(f"Extracted references for {pdf_filename}.")
 
             except Exception as e:
-                print(f"Error extracting references for {pdf_filename}: {e}")
+                self._log(f"Error extracting references for {pdf_filename}:", e)
 
-    def ensure_unique_citation_keys(self):
+        if changed:
+            self.save_metadata()
+
+    def ensure_unique_citation_keys(self) -> None:
         """
-        Ensures each reference entry in metadata has a unique citation_key.
-        If collisions are found, minimally rename subsequent duplicates with
-        a numeric suffix, e.g. 'smith2021' -> 'smith2021-2', etc.
+        Ensure each reference entry has a unique citation_key. If collisions
+        occur, append -2, -3, ... to later ones.
         """
-        # Collect citation_key usage
-        key_to_pdf_map = {}  # citation_key -> list of pdf_filenames
+        key_map: Dict[str, List[str]] = {}
         for pdf_filename, data in self.metadata.items():
-            refs = data.get('references', {})
-            ckey = refs.get('citation_key')
-            if ckey:
-                key_to_pdf_map.setdefault(ckey, []).append(pdf_filename)
+            refs = data.get("references") or {}
+            key = refs.get("citation_key")
+            if not key:
+                continue
+            key_map.setdefault(key, []).append(pdf_filename)
 
-        # For any citation_key with >1 PDF, rename duplicates
-        all_used_keys = set(key_to_pdf_map.keys())
-        for ckey, pdf_list in key_to_pdf_map.items():
-            if len(pdf_list) > 1:
-                # keep the first as-is, rename subsequent collisions
-                for idx, pdf_filename in enumerate(pdf_list):
-                    if idx == 0:
-                        continue
-                    data = self.metadata[pdf_filename]
-                    refs = data.get('references', {})
+        changed = False
+        for key, pdfs in key_map.items():
+            if len(pdfs) <= 1:
+                continue
+            for i, pdf_filename in enumerate(pdfs[1:], start=2):
+                refs = self.metadata[pdf_filename].get("references") or {}
+                new_key = f"{key}-{i}"
+                refs["citation_key"] = new_key
+                changed = True
+                self._log(
+                    f"Renamed citation_key for {pdf_filename}: {key} -> {new_key}"
+                )
 
-                    new_key = ckey
-                    suffix_num = 2
-                    # Generate new keys until unique
-                    while new_key in all_used_keys:
-                        new_key = f"{ckey}-{suffix_num}"
-                        suffix_num += 1
+        if changed:
+            self.save_metadata()
+            self._log("Ensured uniqueness of citation keys.")
+        else:
+            self._log("No duplicate citation keys found.")
 
-                    refs['citation_key'] = new_key
-                    all_used_keys.add(new_key)
+    @staticmethod
+    def _escape_bibtex_value(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace("{", "\\{")
+            .replace("}", "\\}")
+        )
 
-        self.save_metadata()
-        print("Ensured uniqueness of citation keys and saved updated metadata.")
-
-    def generate_references_bib(self):
+    def generate_references_bib(self) -> None:
         """
-        Generates the references.bib file using the data in the 'references' sub-dictionary
-        of the metadata entries.
+        Write references.bib based on metadata['references'].
         """
         try:
-            with open(self.reference_file, 'w', encoding='utf-8') as f:
+            with self.reference_file.open("w", encoding="utf-8") as f:
                 for pdf_filename, data in self.metadata.items():
-                    references = data.get('references', {})
-                    if not references:
-                        continue  # Skip if no references data
+                    refs = data.get("references") or {}
+                    if not refs:
+                        continue
 
-                    # Use provided 'type' field; default to "misc" if not present
-                    entry_type = references.get('type', 'misc')
+                    entry_type = refs.get("type", "misc")
+                    citation_key = refs.get("citation_key")
+                    if not citation_key:
+                        stem = Path(pdf_filename).stem.replace(" ", "_")
+                        citation_key = stem
+                        refs["citation_key"] = citation_key
 
-                    # Use provided 'citation_key' field; if missing, generate a fallback from pdf_filename
-                    citation_key = references.get('citation_key')
-                    if not citation_key or not isinstance(citation_key, str) or citation_key.strip() == '':
-                        # Fallback: all lowercase, remove special chars
-                        base_key = os.path.splitext(pdf_filename)[0]
-                        base_key = ''.join(ch for ch in base_key.lower() if ch.isalnum())
-                        citation_key = base_key if base_key else 'unknownkey'
-
-                    bib_entry = f"@{entry_type}{{{citation_key},\n"
-                    for key, value in references.items():
-                        # Skip 'type' and 'citation_key' fields as they are not BibTeX fields
-                        if key in ['type', 'citation_key']:
+                    f.write(f"@{entry_type}{{{citation_key},\n")
+                    for key, raw_value in refs.items():
+                        if key in ("type", "citation_key"):
                             continue
-
-                        if value is None or value == '':
+                        if raw_value is None or raw_value == "":
                             continue
-                        # Convert value to string if it's not already
-                        if isinstance(value, list):
-                            # Convert all elements in the list to strings
-                            value = [str(item) for item in value]
-                            # Join list elements using ' and '
-                            value = ' and '.join(value)
+                        if isinstance(raw_value, list):
+                            value = " and ".join(map(str, raw_value))
                         else:
-                            value = str(value)
+                            value = str(raw_value)
+                        value = self._escape_bibtex_value(value)
+                        f.write(f"  {key} = {{{value}}},\n")
+                    f.write("}\n\n")
 
-                        # Escape special characters in value
-                        value = value.replace('\\', '\\\\').replace('{', '\\{').replace('}', '\\}')
-
-                        bib_entry += f"  {key} = {{{value}}},\n"
-                    bib_entry += "}\n\n"
-
-                    f.write(bib_entry)
-            print(f"Generated {self.reference_file} using references data.")
+            self._log(f"Generated {self.reference_file}.")
         except Exception as e:
-            print(f"Error generating references.bib: {e}")
+            self._log("Error writing references.bib:", e)
 
-    def generate_embeddings(self, texts):
+    # ------------------------------------------------------------------
+    # searching
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, top_k: int = 5) -> List[dict]:
         """
-        Generates embeddings for a list of texts.
+        Vector search over chunk embeddings.
 
-        Args:
-            texts (List[str]): The list of texts to embed.
-
-        Returns:
-            List[List[float]]: A list of embeddings.
+        Returns a list of dicts:
+            {
+                "pdf_filename": str,
+                "chunk_filename": str,
+                "similarity_score": float,
+                "references": dict,
+            }
         """
-        response = self.client.embeddings.create(
-            input=texts,
-            model=self.embedding_model
-        )
-        embeddings = [data.embedding for data in response.data]
-        return embeddings
+        top_k = max(1, int(top_k))
 
-    def process_embeddings(self):
-        """
-        Generates embeddings for chunks listed in the metadata and updates their 'embedding_index'.
-        Processes embeddings in batches for efficiency.
-        """
-        # Collect all chunks that need embeddings
-        chunks_to_embed = []
-        chunk_texts = []
-        for pdf_filename, data in self.metadata.items():
-            if not data.get('chunked'):
-                continue
-
-            # Go through each chunk
-            chunks = data['chunks']
-            for chunk_meta in chunks:
-                if isinstance(chunk_meta.get('embedding_index'), int):
-                    continue  # Embedding already exists
-                # Read the chunk text
-                chunk_filename = chunk_meta['filename']
-                chunk_file_path = os.path.join(self.chunk_files_directory, chunk_filename)
-                try:
-                    with open(chunk_file_path, 'r', encoding='utf-8') as f:
-                        text = f.read()
-                    chunks_to_embed.append({
-                        'pdf_filename': pdf_filename,
-                        'chunk_meta': chunk_meta,
-                        'text': text
-                    })
-                    chunk_texts.append(text)
-                except Exception as e:
-                    print(f"Error reading chunk {chunk_filename}: {e}")
-
-        # Now, batch the embeddings
-        if not chunks_to_embed:
-            print("No new chunks to embed.")
-            return
-
-        total_chunks = len(chunks_to_embed)
-        for i in range(0, total_chunks, self.batch_size):
-            batch = chunks_to_embed[i:i+self.batch_size]
-            batch_texts = [item['text'] for item in batch]
-
-            try:
-                # Generate embeddings for the batch
-                embeddings = self.generate_embeddings(batch_texts)
-                # Append embeddings to self.embeddings
-                start_index = len(self.embeddings)
-                if len(self.embeddings) == 0:
-                    self.embeddings = np.array(embeddings)
-                else:
-                    self.embeddings = np.vstack([self.embeddings, embeddings])
-                # Update chunk_meta with embedding_index
-                for idx, item in enumerate(batch):
-                    embedding_index = start_index + idx
-                    item['chunk_meta']['embedding_index'] = embedding_index
-                    print(f"Generated embedding for chunk {item['chunk_meta']['filename']}.")
-            except Exception as e:
-                print(f"Error generating embeddings for batch starting at index {i}: {e}")
-                continue
-
-        # Save embeddings and metadata
-        self.save_embeddings()
-        self.save_metadata()
-        print(f"Updated embeddings and metadata for all processed chunks.")
-
-    def search(self, query, top_k=5):
-        """
-        Searches for the top_k chunks most similar to the query.
-
-        Args:
-            query (str): The search query.
-            top_k (int): Number of top results to return.
-
-        Returns:
-            List[dict]: List of dictionaries containing information about the top matching chunks.
-        """
-        # Generate embedding for the query
-        query_embedding = self.generate_embeddings([query])[0]
-        # Compute dot product between query embedding and embeddings
-        embeddings = self.embeddings
-        if len(embeddings) == 0:
-            print("No embeddings available for search.")
+        if self.embeddings.size == 0:
+            self._log("No embeddings available for search.")
             return []
-        similarity_scores = np.dot(embeddings, query_embedding)
-        # Get indices of top_k scores
-        top_indices = similarity_scores.argsort()[-top_k:][::-1]
-        # Map embedding indices back to chunks and PDFs
-        results = []
-        for idx in top_indices:
-            # Find which chunk has this embedding index
-            found = False
-            for pdf_filename, data in self.metadata.items():
-                for chunk_meta in data['chunks']:
-                    if chunk_meta.get('embedding_index') == idx:
-                        result = {
-                            'pdf_filename': pdf_filename,
-                            'chunk_filename': chunk_meta['filename'],
-                            'similarity_score': float(similarity_scores[idx]),
-                            'references': data.get('references', {})
-                        }
-                        results.append(result)
-                        found = True
-                        break  # Found the chunk
-                if found:
-                    break  # Found the PDF
+
+        query_embedding = np.array(
+            self.generate_embeddings([query])[0],
+            dtype=np.float32,
+        )
+        scores = self.embeddings @ query_embedding
+
+        k = min(top_k, scores.shape[0])
+        top_indices = np.argsort(scores)[-k:][::-1]
+
+        results: List[dict] = []
+        for emb_idx in top_indices:
+            emb_idx_int = int(emb_idx)
+            mapping = self.embedding_index.get(emb_idx_int)
+            if mapping is None:
+                continue
+            pdf_filename, chunk_idx = mapping
+            data = self.metadata.get(pdf_filename) or {}
+            chunks = data.get("chunks") or []
+            if not (0 <= chunk_idx < len(chunks)):
+                continue
+            chunk_meta = chunks[chunk_idx]
+            chunk_filename = chunk_meta.get("filename")
+            if not chunk_filename:
+                continue
+
+            results.append(
+                {
+                    "pdf_filename": pdf_filename,
+                    "chunk_filename": chunk_filename,
+                    "similarity_score": float(scores[emb_idx]),
+                    "references": data.get("references", {}),
+                }
+            )
+
         return results
 
-    def remove_pdf_entry(self, pdf_filename):
+    # ------------------------------------------------------------------
+    # destructive operations
+    # ------------------------------------------------------------------
+
+    def remove_pdf_entry(self, pdf_filename: str) -> None:
         """
-        Removes a PDF entry from metadata, moves the PDF file to unscannable,
-        removes associated text/chunk files, removes embeddings from self.embeddings,
-        and reindexes everything. Finally, saves updated metadata and embeddings.
+        Remove a PDF from metadata, move the PDF to pdfs/unscannable/,
+        delete associated text/chunk files, remove its embeddings, and
+        reindex the remaining embeddings and metadata.
         """
-        data = self.metadata.pop(pdf_filename, None)
-        if not data:
-            print(f"No metadata found for {pdf_filename}. Nothing to remove.")
+        if pdf_filename not in self.metadata:
+            self._log(f"No metadata found for {pdf_filename}. Nothing to remove.")
             return
 
-        # 1) Move the PDF file to unscannable/ if it exists
-        pdf_path = os.path.join(self.pdf_files_directory, pdf_filename)
-        unscannable_path = os.path.join(self.unscannable_pdfs_path, pdf_filename)
-        if os.path.exists(pdf_path):
-            try:
-                os.replace(pdf_path, unscannable_path)
-                print(f"Moved {pdf_filename} to {unscannable_path}.")
-            except Exception as e:
-                print(f"Error moving {pdf_filename} to unscannable: {e}")
+        data = self.metadata[pdf_filename]
+        chunks = data.get("chunks") or []
 
-        # 2) Remove the text file if it exists
-        text_filename = data.get("text_filename", "")
+        # collect embedding indices
+        to_remove_indices = sorted(
+            idx
+            for idx in (
+                ch.get("embedding_index") for ch in chunks
+            )
+            if isinstance(idx, int)
+        )
+
+        # move PDF
+        pdf_path = self.pdf_files_directory / pdf_filename
+        self.unscannable_pdfs_path.mkdir(parents=True, exist_ok=True)
+        if pdf_path.exists():
+            dest = self.unscannable_pdfs_path / pdf_filename
+            pdf_path.replace(dest)
+            self._log(f"Moved {pdf_filename} to {dest}")
+        else:
+            self._log(f"PDF file not found on disk: {pdf_path}")
+
+        # remove text file
+        text_filename = data.get("text_filename")
         if text_filename:
-            text_path = os.path.join(self.text_files_directory, text_filename)
-            if os.path.exists(text_path):
-                try:
-                    os.remove(text_path)
-                    print(f"Removed text file {text_path}.")
-                except Exception as e:
-                    print(f"Error removing text file {text_path}: {e}")
+            text_path = self.text_files_directory / text_filename
+            if text_path.exists():
+                text_path.unlink()
+                self._log(f"Deleted text file {text_path}")
 
-        # 3) Remove chunk files and track their embedding indexes
-        embedding_indexes_to_remove = []
-        chunks = data.get("chunks", [])
-        for chunk_meta in chunks:
-            chunk_file = chunk_meta.get("filename")
-            if chunk_file:
-                chunk_path = os.path.join(self.chunk_files_directory, chunk_file)
-                if os.path.exists(chunk_path):
-                    try:
-                        os.remove(chunk_path)
-                        print(f"Removed chunk file {chunk_path}.")
-                    except Exception as e:
-                        print(f"Error removing chunk file {chunk_path}: {e}")
+        # remove chunk files
+        for ch in chunks:
+            chunk_filename = ch.get("filename")
+            if not chunk_filename:
+                continue
+            chunk_path = self.chunk_files_directory / chunk_filename
+            if chunk_path.exists():
+                chunk_path.unlink()
+                self._log(f"Deleted chunk file {chunk_path}")
 
-            # Collect embedding index so we can remove from self.embeddings
-            idx = chunk_meta.get("embedding_index")
-            if isinstance(idx, int):
-                embedding_indexes_to_remove.append(idx)
+        # remove metadata entry
+        del self.metadata[pdf_filename]
 
-        if not len(embedding_indexes_to_remove):
-            # Save updated metadata (PDF is removed) and we're done
-            self.save_metadata()
-            print(f"No embeddings to remove for {pdf_filename}. Done.")
-            return
+        # remove embeddings and reindex
+        if self.embeddings.size > 0 and to_remove_indices:
+            old_count = len(self.embeddings)
+            keep_mask = np.ones(old_count, dtype=bool)
+            for idx in to_remove_indices:
+                if 0 <= idx < old_count:
+                    keep_mask[idx] = False
 
-        embedding_indexes_to_remove.sort()
+            new_embeddings = self.embeddings[keep_mask]
 
-        # 4) Create a mask for embeddings to keep
-        old_count = len(self.embeddings)
-        keep_mask = np.ones(old_count, dtype=bool)
-        for idx in embedding_indexes_to_remove:
-            if 0 <= idx < old_count:
-                keep_mask[idx] = False
+            # map old index -> new index (or None if dropped)
+            old_to_new: Dict[int, Optional[int]] = {}
+            new_idx = 0
+            for i in range(old_count):
+                if keep_mask[i]:
+                    old_to_new[i] = new_idx
+                    new_idx += 1
+                else:
+                    old_to_new[i] = None
 
-        new_embeddings = self.embeddings[keep_mask]
+            # update embedding_index stored in chunks
+            for pdf, mdata in self.metadata.items():
+                for ch in mdata.get("chunks") or []:
+                    old_idx = ch.get("embedding_index")
+                    if not isinstance(old_idx, int):
+                        continue
+                    new_val = old_to_new.get(old_idx)
+                    ch["embedding_index"] = new_val
 
-        # 5) Build an old->new index map
-        old_to_new = [None] * old_count
-        new_index = 0
-        for i in range(old_count):
-            if keep_mask[i]:
-                old_to_new[i] = new_index
-                new_index += 1
+            self.embeddings = new_embeddings
+            self.save_embeddings()
 
-        # Now update embedding_index references in the remaining PDFs
-        for other_pdf, other_data in self.metadata.items():
-            for ch in other_data.get("chunks", []):
-                idx = ch.get("embedding_index")
-                if isinstance(idx, int) and idx < old_count:
-                    new_idx = old_to_new[idx]
-                    if new_idx is None:
-                        ch["embedding_index"] = None
-                    else:
-                        ch["embedding_index"] = new_idx
-
-        # 6) Assign the new embeddings array
-        self.embeddings = new_embeddings
-
-        # 7) Save everything
         self.save_metadata()
-        self.save_embeddings()
-        print(f"Removed {pdf_filename} from metadata, reindexed embeddings, and saved changes.")
+        self._build_embedding_index()
+        self._log(
+            f"Removed {pdf_filename}, reindexed embeddings, and saved metadata."
+        )
 
 
-if __name__ == "__main__":
-    dm = DataManager()
+def run_pipeline(dm: DataManager) -> None:
+    """
+    Convenience pipeline: new PDFs -> text -> chunks -> embeddings.
+    """
     dm.update_metadata()
     dm.process_pdfs()
     dm.chunk_text_files()
     dm.process_embeddings()
-    dm.extract_references()
-    dm.ensure_unique_citation_keys()
-    # VVV MAKE A NEW BOOLEAN FOR THIS
-    #dm.clean_metadata_references()
-    dm.generate_references_bib()
-    dm.remove_problematic_entries()
+    dm._log("Pipeline completed.")
 
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DataManager pipeline helper")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="pipeline",
+        choices=["pipeline", "update", "embed", "bib", "clean"],
+        help="pipeline|update|embed|bib|clean",
+    )
+    args = parser.parse_args()
+
+    dm = DataManager()
+
+    if args.command == "pipeline":
+        run_pipeline(dm)
+        dm.extract_references()
+        dm.ensure_unique_citation_keys()
+        dm.clean_metadata()
+        dm.clean_metadata_references()
+        dm.generate_references_bib()
+    elif args.command == "update":
+        dm.update_metadata()
+        dm.process_pdfs()
+        dm.chunk_text_files()
+    elif args.command == "embed":
+        dm.process_embeddings()
+    elif args.command == "bib":
+        dm.extract_references()
+        dm.ensure_unique_citation_keys()
+        dm.clean_metadata()
+        dm.clean_metadata_references()
+        dm.generate_references_bib()
+    elif args.command == "clean":
+        dm.clean_metadata()
+        dm.clean_metadata_references()
