@@ -5,19 +5,13 @@ import time
 import re
 import threading
 import subprocess
+import shutil
 from typing import Optional, List, Dict, Any
 
-import pyperclip
 from dotenv import load_dotenv
 
 from PyQt5.QtCore import Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import (
-    QFont,
-    QTextCursor,
-    QKeyEvent,
-    QKeySequence,
-    QDesktopServices,
-)
+from PyQt5.QtGui import QFont, QKeyEvent, QKeySequence, QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
@@ -27,11 +21,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QLabel,
     QFrame,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
-    QScrollArea,
-    QSizePolicy,
     QShortcut,
     QCheckBox,
 )
@@ -42,7 +32,7 @@ from openai import OpenAI
 from data_manager import DataManager, run_pipeline
 
 
-# ---------- config ----------
+# ---------- config & helpers ----------
 
 load_dotenv()
 
@@ -64,11 +54,115 @@ os.makedirs(APP_SESSIONS_PATH, exist_ok=True)
 THESIS_DIR = os.path.join(DATA_SERVER, "thesis")
 os.makedirs(THESIS_DIR, exist_ok=True)
 
-MAX_HISTORY = 40  # system + last 39 messages
-DEFAULT_TOP_K = 5
+# approximate maximum context tokens; we stay below ~80% of this
+CONTEXT_TOKEN_LIMIT = int(os.getenv("CONTEXT_TOKEN_LIMIT", "96000"))
+CONTEXT_TRIGGER_TOKENS = int(CONTEXT_TOKEN_LIMIT * 0.8)
 
-# ---- tools exposed to the model (for thesis operations) ----
+# how many most recent messages to keep verbatim when compressing
+COMPRESS_KEEP_LAST = int(os.getenv("COMPRESS_KEEP_LAST", "12"))
 
+# RAG retrieval size
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "20"))
+
+client = OpenAI()
+
+
+def escape_html(text: str) -> str:
+    """Basic HTML escaping with newline -> <br>."""
+    if text is None:
+        return ""
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("\n", "<br>")
+    return text
+
+
+def estimate_tokens_for_messages(messages: List[Dict[str, Any]]) -> int:
+    """
+    Very rough token estimate: chars/4.
+    Good enough to trigger compression before we hit hard limits.
+    """
+    total_chars = 0
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+    return total_chars // 4
+
+
+def compress_history_if_needed(
+    messages: List[Dict[str, Any]],
+    client: OpenAI,
+    keep_last: int = COMPRESS_KEEP_LAST,
+) -> List[Dict[str, Any]]:
+    """
+    If conversation is getting long, summarize earlier user/assistant messages into
+    a compact system 'summary' message, keeping the last `keep_last` messages intact.
+    """
+    est_tokens = estimate_tokens_for_messages(messages)
+    if est_tokens <= CONTEXT_TRIGGER_TOKENS:
+        return list(messages)
+
+    if len(messages) <= keep_last + 2:
+        return list(messages)
+
+    # Split into "summarizable" prefix and "tail" that we keep verbatim.
+    summarizable = messages[:-keep_last]
+    tail = messages[-keep_last:]
+
+    # Only summarize user/assistant messages; tools/system content is handled separately.
+    to_summarize = [
+        m for m in summarizable
+        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+    ]
+
+    if not to_summarize:
+        return list(messages)
+
+    summary_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are summarizing an earlier technical conversation between a user and an assistant.\n"
+                "Produce a concise summary (300–500 words) that preserves:\n"
+                "- key definitions, equations, and LaTeX snippets\n"
+                "- important decisions or conclusions\n"
+                "- open questions or TODOs.\n"
+                "Do NOT include any meta-comments about tools or the system; just summarize the content."
+            ),
+        }
+    ] + to_summarize
+
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=summary_prompt,
+        )
+        summary_text = resp.choices[0].message.content or ""
+    except Exception:
+        # If summarization fails for any reason, just fall back to original messages.
+        return list(messages)
+
+    # Keep all system messages from the original conversation
+    new_messages: List[Dict[str, Any]] = [
+        m for m in messages if m.get("role") == "system"
+    ]
+
+    # Add our summary as a synthetic system message
+    new_messages.append(
+        {
+            "role": "system",
+            "content": "Summary of earlier conversation (for context):\n" + summary_text,
+        }
+    )
+
+    # Append the tail messages unchanged
+    new_messages.extend(tail)
+
+    return new_messages
+
+
+# Tools exposed to the model for thesis operations
 TOOLS = [
     {
         "type": "function",
@@ -124,7 +218,10 @@ TOOLS = [
                     },
                     "new_text": {
                         "type": "string",
-                        "description": "Full replacement LaTeX source for that section, including its \\section/\\subsection line.",
+                        "description": (
+                            "Full replacement LaTeX source for that section, including its "
+                            "\\section/\\subsection line."
+                        ),
                     },
                 },
                 "required": ["index", "new_text"],
@@ -133,36 +230,6 @@ TOOLS = [
         },
     },
 ]
-
-
-
-client = OpenAI()
-
-
-def escape_html(text: str) -> str:
-    """Basic HTML escaping with newline -> <br>."""
-    if text is None:
-        return ""
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;").replace(">", "&gt;")
-    text = text.replace("\n", "<br>")
-    return text
-
-
-class SnippetDialog(QDialog):
-    def __init__(self, snippet: str, pdf_name: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Snippet from {pdf_name}")
-        layout = QVBoxLayout(self)
-        self.text_edit = QTextEdit(self)
-        self.text_edit.setPlainText(snippet)
-        self.text_edit.setReadOnly(True)
-        self.text_edit.moveCursor(QTextCursor.End)
-        layout.addWidget(self.text_edit)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok, parent=self)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(buttons)
 
 
 class InputTextEdit(QTextEdit):
@@ -202,11 +269,6 @@ class ReferenceChatGUI(QWidget):
         self.html_messages: List[str] = []
         self.typing_indicator_visible = False
 
-        # RAG snippet state
-        self.indexed_snippets: List[Dict[str, Any]] = []
-        self.snippet_cache: Dict[tuple, int] = {}  # (pdf_filename, snippet) -> id
-        self.displayed_equations: List[str] = []
-
         # settings
         self.citations_enabled = True
 
@@ -214,8 +276,6 @@ class ReferenceChatGUI(QWidget):
         self.current_tex_path: Optional[str] = None
         self.current_tex_content: str = ""
         self.thesis_sections: List[Dict[str, Any]] = []
-        self.current_thesis_section: Optional[Dict[str, Any]] = None
-        self.current_thesis_section_text: str = ""
 
         self.send_button_normal_style = (
             "background-color: #4CAF50; color: white; padding: 6px 12px;"
@@ -232,7 +292,6 @@ class ReferenceChatGUI(QWidget):
         self.new_session()
 
     # ---------- UI ----------
-
 
     def init_ui(self):
         self.setWindowTitle("GPT Reference Assistant")
@@ -256,23 +315,6 @@ class ReferenceChatGUI(QWidget):
         QPushButton:hover {
             background-color: #45a049;
         }
-        QScrollArea {
-            border: none;
-        }
-        QScrollBar:vertical {
-            background: #2a2a2a;
-            width: 10px;
-            margin: 0px;
-        }
-        QScrollBar::handle:vertical {
-            background: #555555;
-            border-radius: 5px;
-        }
-        QScrollBar::add-line:vertical,
-        QScrollBar::sub-line:vertical {
-            background: none;
-            height: 0;
-        }
         """
         )
 
@@ -291,7 +333,7 @@ class ReferenceChatGUI(QWidget):
         load_button = QPushButton("Load")
         load_button.clicked.connect(self.load_session)
 
-        self.citations_checkbox = QCheckBox("Enable citations")
+        self.citations_checkbox = QCheckBox("Use RAG context")
         self.citations_checkbox.setChecked(True)
         self.citations_checkbox.stateChanged.connect(
             lambda state: setattr(self, "citations_enabled", bool(state))
@@ -316,25 +358,19 @@ class ReferenceChatGUI(QWidget):
         menu_layout.addWidget(thesis_pdf_button)
         main_layout.addLayout(menu_layout)
 
-        # main split
-        content_layout = QHBoxLayout()
+        # main chat area
+        content_layout = QVBoxLayout()
         content_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.addLayout(content_layout)
-
-        # left: chat
-        left_layout = QVBoxLayout()
-        left_layout.setContentsMargins(5, 5, 5, 5)
-        left_layout.setSpacing(5)
 
         title_label = QLabel("GPT Reference Assistant")
         title_label.setFont(QFont("Arial", 20, QFont.Bold))
         title_label.setAlignment(Qt.AlignHCenter)
         title_label.setStyleSheet("color: #4CAF50;")
-        left_layout.addWidget(title_label)
+        content_layout.addWidget(title_label)
 
         self.web_view = QWebEngineView(self)
-        self.web_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        left_layout.addWidget(self.web_view)
+        content_layout.addWidget(self.web_view)
 
         # input
         input_frame = QFrame(self)
@@ -354,30 +390,7 @@ class ReferenceChatGUI(QWidget):
 
         input_layout.addWidget(self.input_text)
         input_layout.addWidget(self.send_button)
-        left_layout.addWidget(input_frame)
-
-        # right: snippets & equations
-        right_layout = QVBoxLayout()
-        right_layout.setContentsMargins(5, 5, 5, 5)
-        right_layout.setSpacing(5)
-
-        self.right_panel_label = QLabel("Citations & Equations")
-        self.right_panel_label.setFont(QFont("Arial", 16, QFont.Bold))
-        self.right_panel_label.setStyleSheet("color: #4CAF50;")
-        right_layout.addWidget(self.right_panel_label)
-
-        self.right_scroll = QScrollArea(self)
-        self.right_scroll.setWidgetResizable(True)
-        self.right_inner_layout = QVBoxLayout()
-        self.right_inner_layout.setContentsMargins(5, 5, 5, 5)
-        self.right_inner_layout.setSpacing(5)
-        right_widget = QWidget()
-        right_widget.setLayout(self.right_inner_layout)
-        self.right_scroll.setWidget(right_widget)
-        right_layout.addWidget(self.right_scroll)
-
-        content_layout.addLayout(left_layout, stretch=2)
-        content_layout.addLayout(right_layout, stretch=1)
+        content_layout.addWidget(input_frame)
 
         # shortcuts
         self.shortcut_new = QShortcut(QKeySequence("Ctrl+N"), self)
@@ -391,12 +404,6 @@ class ReferenceChatGUI(QWidget):
         self.showMaximized()
 
     # ---------- chat helpers ----------
-
-    def get_limited_history(self) -> List[Dict[str, Any]]:
-        msgs = self.messages
-        if len(msgs) <= MAX_HISTORY:
-            return msgs
-        return [msgs[0]] + msgs[-(MAX_HISTORY - 1):]
 
     def show_typing_indicator(self, show: bool = True):
         self.typing_indicator_visible = show
@@ -477,6 +484,10 @@ window.MathJax = {
 </html>
 """
         self.web_view.setHtml(html_head + html_body + html_footer)
+        # Auto-scroll to bottom
+        self.web_view.page().runJavaScript(
+            "window.scrollTo(0, document.body.scrollHeight);"
+        )
 
     # ---------- session ----------
 
@@ -485,27 +496,25 @@ window.MathJax = {
             {
                 "role": "system",
                 "content": (
-                    "- You are a research assistant helping with a LaTeX-based physics thesis.\n"
-                    "- The user maintains a local PDF corpus; you may be given snippets from it as context.\n"
-                    "- The user also has a main LaTeX thesis file; when a 'current section' is provided, "
-                    "treat that section as primary context and edit only that section unless instructed otherwise.\n"
-                    "- DO NOT narrate internal reasoning, searches, or tools. Just provide final answers.\n"
-                    "- When citing, always use LaTeX \\cite{<citation_key>} with keys that are explicitly given "
-                    "in the context or by the user. Never invent new citation keys.\n"
-                    "- Preserve LaTeX structure and commands; only adjust wording / insert citations.\n"
-             ),
+                    "You are a research assistant helping with a LaTeX-based physics thesis.\n"
+                    "- The user has a local PDF corpus; you may be given short snippets from it as context.\n"
+                    "- The user also has a main LaTeX thesis file on disk. You have tools you can call:\n"
+                    "  * read_thesis_metadata: list sections/subsections.\n"
+                    "  * read_thesis_section: read the LaTeX source of a section.\n"
+                    "  * write_thesis_section: overwrite a section with new LaTeX.\n"
+                    "- When you need to inspect or edit the thesis, call these tools instead of guessing.\n"
+                    "- Only call write_thesis_section after the user has explicitly agreed to apply the changes.\n"
+                    "- Do NOT narrate your internal reasoning or tool usage. Just provide the resulting text "
+                    "and a concise description of what changed.\n"
+                    "- When adding citations, use LaTeX \\cite{<citation_key>} with keys explicitly given to you; "
+                    "never invent new citation keys."
+                ),
             }
         ]
         self.html_messages = []
-        self.indexed_snippets = []
-        self.snippet_cache = {}
-        self.displayed_equations = []
-        self.current_thesis_section = None
-        self.current_thesis_section_text = ""
         self.typing_indicator_visible = False
 
         self.update_html()
-        self.update_right_panel()
         self.set_send_button_pressed(False)
         print("New session started.")
 
@@ -527,29 +536,13 @@ window.MathJax = {
             if handled:
                 return
 
-        # add to conversation history
-        self.messages.append({"role": "user", "content": stripped})
+        # snapshot of history BEFORE adding this user message
+        history = list(self.messages)
 
-        # build additional context (thesis + RAG)
+        # build additional context (RAG from local corpus)
         context_messages: List[Dict[str, Any]] = []
-
-        # 1) thesis section: highest priority
-        if self.current_thesis_section_text:
-            context_messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Here is the current section of my thesis that should guide your answer. "
-                        "Please edit only this section unless I say otherwise:\n\n"
-                        + self.current_thesis_section_text
-                    ),
-                }
-            )
-
-        # 2) RAG context
         if self.citations_enabled:
-            results = self.dm.search(stripped, top_k=DEFAULT_TOP_K)
-            self.update_snippets_from_results(results)
+            results = self.dm.search(stripped, top_k=RAG_TOP_K)
             rag_context = self.build_rag_context(results)
             if rag_context:
                 context_messages.append(
@@ -559,21 +552,28 @@ window.MathJax = {
                     }
                 )
 
-        # messages for model = history + context + last user query (again)
-        history = self.get_limited_history()
-        messages_for_model = history + context_messages + [{"role": "user", "content": stripped}]
+        # messages for model = history + context + new user turn
+        messages_for_model = (
+            history
+            + context_messages
+            + [{"role": "user", "content": stripped}]
+        )
+
+        # record user message in canonical history
+        self.messages.append({"role": "user", "content": stripped})
 
         # call model in background
         self.show_typing_indicator(True)
         self.set_send_button_pressed(True)
         self.start_model_thread(messages_for_model)
 
-    # ---------- background model calls ----------
+    # ---------- background model calls (tools + compression) ----------
 
     def start_model_thread(self, messages: List[Dict[str, Any]]):
         def worker():
-            # local copy so we don't mutate self.messages from this thread
-            model_messages = list(messages)
+            # compress history if needed before tool loop
+            model_messages = compress_history_if_needed(messages, client)
+
             final_content = ""
 
             while True:
@@ -598,7 +598,7 @@ window.MathJax = {
                     final_content = msg.content or ""
                     break
 
-                # Record the assistant's tool request in the local transcript
+                # Record the assistant's tool request in the local loop transcript
                 model_messages.append(
                     {
                         "role": "assistant",
@@ -647,12 +647,11 @@ window.MathJax = {
                         }
                     )
 
-            # At this point we have a final answer
+            # Final answer
             self.model_reply_ready.emit(final_content)
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
 
     def on_model_reply_ready(self, content: str):
         self.show_typing_indicator(False)
@@ -660,10 +659,6 @@ window.MathJax = {
         if content.strip():
             self.messages.append({"role": "assistant", "content": content})
             self.append_assistant_message(escape_html(content))
-            for eq_full in self.extract_equations(content):
-                if eq_full not in self.displayed_equations:
-                    self.displayed_equations.append(eq_full)
-            self.update_right_panel()
 
     def on_model_error(self, err: str):
         self.show_typing_indicator(False)
@@ -691,10 +686,7 @@ window.MathJax = {
                 "<br>"
                 "<b>Thesis-specific:</b><br>"
                 "<code>:thesis-open [path]</code> – load Thesis.tex (defaults to DATA_SERVER/thesis/Thesis.tex)<br>"
-                "<code>:thesis-section &lt;pattern&gt;</code> – focus on section/subsection whose title contains pattern<br>"
-                "<code>:thesis-clear</code> – clear current section context<br>"
-                "<code>:thesis-apply</code> – replace current section in file with last assistant message<br>"
-                "<code>:thesis-compile</code> – run pdflatex and open PDF<br>"
+                "<code>:thesis-compile</code> – run latexmk/pdflatex+bibtex from the TeX directory and open the PDF<br>"
                 "<code>:thesis-pdf</code> – open compiled thesis PDF<br>"
                 "<br>"
                 "<b>Generic TeX commands:</b><br>"
@@ -725,20 +717,6 @@ window.MathJax = {
 
         if name == ":thesis-open":
             self.load_thesis_from_default(arg)
-            return True
-
-        if name == ":thesis-section":
-            self.select_thesis_section(arg)
-            return True
-
-        if name == ":thesis-clear":
-            self.current_thesis_section = None
-            self.current_thesis_section_text = ""
-            self.append_assistant_message("Cleared current thesis section context.")
-            return True
-
-        if name == ":thesis-apply":
-            self.apply_last_answer_to_current_section()
             return True
 
         if name == ":thesis-compile":
@@ -838,8 +816,7 @@ window.MathJax = {
                         f"({len(self.current_tex_content.splitlines())} lines)."
                     )
                 )
-                # reparse sections if this is the thesis
-                if self.current_tex_path and os.path.dirname(self.current_tex_path) == os.path.abspath(THESIS_DIR):
+                if os.path.dirname(self.current_tex_path) == os.path.abspath(THESIS_DIR):
                     self.parse_thesis_sections()
             except Exception as e:
                 self.append_assistant_message(
@@ -893,15 +870,13 @@ window.MathJax = {
 
             if treat_as_thesis:
                 self.parse_thesis_sections()
-                self.current_thesis_section = None
-                self.current_thesis_section_text = ""
                 self.messages.append(
                     {
                         "role": "system",
                         "content": (
                             f"The user has loaded their thesis from '{self.current_tex_path}'. "
-                            "When they ask for edits, assume this is the main document. "
-                            "Use the current section context when provided."
+                            "When they ask for edits, assume this is the main document and use the tools "
+                            "to inspect and modify its sections."
                         ),
                     }
                 )
@@ -952,108 +927,16 @@ window.MathJax = {
                 {"level": level, "title": title, "start": start, "end": end}
             )
 
-    def select_thesis_section(self, pattern: str):
-        if not self.current_tex_content:
-            self.append_assistant_message(
-                "No thesis file loaded. Use <code>:thesis-open</code> first."
-            )
-            return
-        if not pattern:
-            self.append_assistant_message(
-                "Usage: <code>:thesis-section &lt;pattern&gt;</code>."
-            )
-            return
-
-        if not self.thesis_sections:
-            self.parse_thesis_sections()
-
-        patt = pattern.lower()
-        chosen = None
-        for sec in self.thesis_sections:
-            if patt in sec["title"].lower():
-                chosen = sec
-                break
-
-        if not chosen:
-            self.append_assistant_message(
-                escape_html(f"No section or subsection title contains '{pattern}'.")
-            )
-            return
-
-        self.current_thesis_section = chosen
-        start, end = chosen["start"], chosen["end"]
-        self.current_thesis_section_text = self.current_tex_content[start:end]
-
-        preview = "\n".join(self.current_thesis_section_text.splitlines()[:20])
-        msg = (
-            f"Selected {chosen['level']} '{chosen['title']}' as current thesis section context.\n"
-            "I will prioritize this section in my answers.\n\n"
-            "Preview (first ~20 lines):\n\n" + preview
-        )
-        self.append_assistant_message(escape_html(msg))
-
-    def apply_last_answer_to_current_section(self):
-        if not self.current_tex_path:
-            self.append_assistant_message(
-                "No thesis file loaded. Use <code>:thesis-open</code> first."
-            )
-            return
-        if not self.current_thesis_section:
-            self.append_assistant_message(
-                "No current thesis section selected. Use <code>:thesis-section</code> first."
-            )
-            return
-
-        last_assistant = None
-        for m in reversed(self.messages):
-            if m.get("role") == "assistant" and m.get("content"):
-                last_assistant = m["content"]
-                break
-
-        if not last_assistant:
-            self.append_assistant_message(
-                "No assistant message found to apply to the thesis."
-            )
-            return
-
-        sec = self.current_thesis_section
-        start, end = sec["start"], sec["end"]
-
-        try:
-            # splice new content into TeX buffer
-            self.current_tex_content = (
-                self.current_tex_content[:start]
-                + last_assistant
-                + self.current_tex_content[end:]
-            )
-            with open(self.current_tex_path, "w", encoding="utf-8") as f:
-                f.write(self.current_tex_content)
-
-            # reparse sections and reselect by title
-            old_title = sec["title"]
-            self.parse_thesis_sections()
-            self.current_thesis_section = None
-            self.current_thesis_section_text = ""
-
-            for new_sec in self.thesis_sections:
-                if new_sec["title"] == old_title and new_sec["level"] == sec["level"]:
-                    self.current_thesis_section = new_sec
-                    s2, e2 = new_sec["start"], new_sec["end"]
-                    self.current_thesis_section_text = self.current_tex_content[s2:e2]
-                    break
-
-            self.append_assistant_message(
-                escape_html(
-                    f"Replaced {sec['level']} '{old_title}' in {self.current_tex_path} "
-                    f"with last assistant message."
-                )
-            )
-        except Exception as e:
-            self.append_assistant_message(
-                escape_html(f"Error applying section update: {e}")
-            )
-
     def compile_thesis(self):
+        """
+        Compile the current thesis file.
+
+        - Runs from the directory that contains the .tex file.
+        - Prefer latexmk -pdf -interaction=nonstopmode -halt-on-error if available.
+        - Otherwise run: pdflatex, bibtex, pdflatex, pdflatex in that directory.
+
+        This ensures relative paths to the .bib file in the LaTeX source resolve correctly.
+        """
         if not self.current_tex_path:
             self.append_assistant_message(
                 "No TeX file loaded. Use <code>:thesis-open</code> or the 'Load Thesis' button."
@@ -1063,35 +946,86 @@ window.MathJax = {
         tex_path = self.current_tex_path
         dirpath = os.path.dirname(tex_path)
         filename = os.path.basename(tex_path)
+        basename = os.path.splitext(filename)[0]
 
         self.append_assistant_message(
-            escape_html(f"Compiling '{filename}' with pdflatex...")
+            escape_html(f"Compiling '{filename}' from directory:\n{dirpath}")
         )
 
         try:
-            result = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", filename],
-                cwd=dirpath,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            if result.returncode != 0:
-                log_lines = result.stdout.splitlines()
-                tail = "\n".join(log_lines[-30:])
-                self.append_assistant_message(
-                    escape_html(
-                        "pdflatex failed. Last ~30 lines of log:\n\n" + tail
+            if shutil.which("latexmk"):
+                # One-shot latexmk run from the TeX directory
+                cmd = [
+                    "latexmk",
+                    "-pdf",
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    filename,
+                ]
+                result = subprocess.run(
+                    cmd,
+                    cwd=dirpath,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    log_lines = result.stdout.splitlines()
+                    tail = "\n".join(log_lines[-30:])
+                    self.append_assistant_message(
+                        escape_html(
+                            "latexmk failed. Last ~30 lines of log:\n\n" + tail
+                        )
                     )
-                )
+                    return
             else:
-                self.append_assistant_message(
-                    escape_html("Compilation finished. Opening PDF...")
-                )
-                self.open_thesis_pdf()
-        except FileNotFoundError:
+                # Manual sequence: pdflatex, bibtex, pdflatex, pdflatex
+                logs = []
+
+                def run_cmd(cmd_list):
+                    r = subprocess.run(
+                        cmd_list,
+                        cwd=dirpath,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    logs.append((cmd_list, r.returncode, r.stdout))
+                    return r
+
+                r1 = run_cmd(["pdflatex", "-interaction=nonstopmode", filename])
+                # bibtex may fail if no .aux or no bibliography; we just report but continue
+                r2 = run_cmd(["bibtex", basename])
+                r3 = run_cmd(["pdflatex", "-interaction=nonstopmode", filename])
+                r4 = run_cmd(["pdflatex", "-interaction=nonstopmode", filename])
+
+                # If final pdflatex failed, show tail of logs
+                if r4.returncode != 0:
+                    all_out = "\n\n".join(
+                        [
+                            f"$ {' '.join(cmd)} (exit {code})\n{out}"
+                            for cmd, code, out in logs
+                        ]
+                    )
+                    lines = all_out.splitlines()
+                    tail = "\n".join(lines[-40:])
+                    self.append_assistant_message(
+                        escape_html(
+                            "Compilation failed. Tail of logs:\n\n" + tail
+                        )
+                    )
+                    return
+
             self.append_assistant_message(
-                "pdflatex not found on PATH. Install TeXLive or ensure pdflatex is in your PATH."
+                escape_html("Compilation finished. Opening PDF...")
+            )
+            self.open_thesis_pdf()
+
+        except FileNotFoundError as e:
+            self.append_assistant_message(
+                escape_html(
+                    f"Compilation tool not found ({e}). Install TeXLive / latexmk or ensure tools are in PATH."
+                )
             )
         except Exception as e:
             self.append_assistant_message(
@@ -1117,14 +1051,13 @@ window.MathJax = {
     def tool_read_thesis_metadata(self) -> Dict[str, Any]:
         """
         Return a simple description of the thesis sections/subsections:
-          { "path": "...", "sections": [ { "index": i, "level": "section"/"subsection", "title": "..." }, ... ] }
+          { "path": "...", "sections": [ { "index": i, "level": "...", "title": "..." }, ... ] }
         """
         if not self.current_tex_path:
             return {
                 "error": "No thesis file loaded. Use :thesis-open or the 'Load Thesis' button first."
             }
 
-        # Make sure sections are parsed
         if not self.thesis_sections:
             self.parse_thesis_sections()
 
@@ -1146,7 +1079,6 @@ window.MathJax = {
     def tool_read_thesis_section(self, index: int) -> Dict[str, Any]:
         """
         Return the LaTeX source for a specific section/subsection.
-        Also sets current_thesis_section/current_thesis_section_text for the GUI.
         """
         if not self.current_tex_path:
             return {
@@ -1164,10 +1096,6 @@ window.MathJax = {
         sec = self.thesis_sections[index]
         start, end = sec["start"], sec["end"]
         text = self.current_tex_content[start:end]
-
-        # update GUI's notion of current section
-        self.current_thesis_section = sec
-        self.current_thesis_section_text = text
 
         return {
             "index": index,
@@ -1210,25 +1138,11 @@ window.MathJax = {
             old_level = sec["level"]
             self.parse_thesis_sections()
 
-            # try to reselect the same section by title+level
-            new_sec = None
-            for s in self.thesis_sections:
-                if s["title"] == old_title and s["level"] == old_level:
-                    new_sec = s
-                    break
-
-            if new_sec is not None:
-                self.current_thesis_section = new_sec
-                self.current_thesis_section_text = self.current_tex_content[
-                    new_sec["start"] : new_sec["end"]
-                ]
-            else:
-                self.current_thesis_section = None
-                self.current_thesis_section_text = ""
-
             return {
                 "status": "ok",
-                "message": f"Replaced {sec['level']} '{sec['title']}' in {self.current_tex_path}.",
+                "message": (
+                    f"Replaced {old_level} '{old_title}' in {self.current_tex_path}."
+                ),
             }
 
         except Exception as e:
@@ -1236,31 +1150,7 @@ window.MathJax = {
                 "error": f"Error writing section: {e}",
             }
 
-
-    # ---------- RAG helpers ----------
-
-    def update_snippets_from_results(self, results: List[dict]):
-        for r in results:
-            snippet = self.get_snippet(r)
-            pdf_name = r["pdf_filename"]
-            citation_key = r.get("references", {}).get("citation_key", "unknown_key")
-
-            key = (pdf_name, snippet)
-            if key in self.snippet_cache:
-                continue
-
-            snippet_id = len(self.indexed_snippets) + 1
-            self.indexed_snippets.append(
-                {
-                    "id": snippet_id,
-                    "citation_key": citation_key,
-                    "pdf_name": pdf_name,
-                    "snippet": snippet,
-                }
-            )
-            self.snippet_cache[key] = snippet_id
-
-        self.update_right_panel()
+    # ---------- RAG helpers (no side panel) ----------
 
     def build_rag_context(self, results: List[dict]) -> str:
         if not results:
@@ -1272,7 +1162,8 @@ window.MathJax = {
         ]
         for i, r in enumerate(results, start=1):
             refs = r.get("references") or {}
-            citation_key = refs.get("citation_key", "unknown_key")
+            # fall back to top-level citation_key if needed
+            citation_key = refs.get("citation_key") or r.get("citation_key", "unknown_key")
             pdf_name = r["pdf_filename"]
             snippet = self.get_snippet(r)
             lines.append(
@@ -1289,109 +1180,11 @@ window.MathJax = {
         except Exception:
             return "Could not read chunk."
 
-    def extract_equations(self, text: str) -> List[str]:
-        pattern = r"\\begin{equation}.*?\\end{equation}"
-        return [m.group(0) for m in re.finditer(pattern, text, flags=re.DOTALL)]
-
-    def update_right_panel(self):
-        # clear
-        for i in reversed(range(self.right_inner_layout.count())):
-            w = self.right_inner_layout.itemAt(i).widget()
-            if w is not None:
-                w.deleteLater()
-
-        # thesis section indicator
-        if self.current_thesis_section:
-            lbl = QLabel(
-                f"Thesis context: {self.current_thesis_section['level']} "
-                f"'{self.current_thesis_section['title']}'"
-            )
-            lbl.setFont(QFont("Arial", 10, QFont.Bold))
-            self.right_inner_layout.addWidget(lbl)
-
-        # snippets
-        for s in self.indexed_snippets:
-            frame = QFrame()
-            layout = QHBoxLayout(frame)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(5)
-
-            id_label = QLabel(f"[{s['id']}]")
-            id_label.setFont(QFont("Arial", 10, QFont.Bold))
-            layout.addWidget(id_label)
-
-            key_label = QLabel(s["citation_key"])
-            key_label.setFont(QFont("Arial", 10))
-            layout.addWidget(key_label)
-
-            cite_button = QPushButton("Copy \\cite")
-            cite_button.setFont(QFont("Arial", 10))
-            citation_text = f"\\cite{{{s['citation_key']}}}"
-            cite_button.clicked.connect(
-                lambda _ch, c=citation_text: self.copy_to_clipboard(c)
-            )
-            layout.addWidget(cite_button)
-
-            snippet_button = QPushButton("Snippet")
-            snippet_button.setFont(QFont("Arial", 10))
-            snippet_button.clicked.connect(
-                lambda _ch, sn=s: self.show_snippet_dialog(sn["snippet"], sn["pdf_name"])
-            )
-            layout.addWidget(snippet_button)
-
-            pdf_button = QPushButton("Open PDF")
-            pdf_button.setFont(QFont("Arial", 10))
-            pdf_button.clicked.connect(
-                lambda _ch, pdfn=s["pdf_name"]: self.open_pdf(pdfn)
-            )
-            layout.addWidget(pdf_button)
-
-            self.right_inner_layout.addWidget(frame)
-
-        # equations
-        for eq_full in self.displayed_equations:
-            eq_frame = QFrame()
-            eq_layout = QHBoxLayout(eq_frame)
-            eq_layout.setContentsMargins(0, 0, 0, 0)
-            eq_layout.setSpacing(5)
-
-            eq_label = QLabel("equation")
-            eq_label.setFont(QFont("Arial", 10, QFont.Bold))
-            eq_layout.addWidget(eq_label)
-
-            copy_button = QPushButton("Copy")
-            copy_button.setFont(QFont("Arial", 10))
-            copy_button.clicked.connect(
-                lambda _ch, eq=eq_full: self.copy_to_clipboard(eq)
-            )
-            eq_layout.addWidget(copy_button)
-
-            self.right_inner_layout.addWidget(eq_frame)
-
-        self.right_inner_layout.addStretch(1)
-
-    def copy_to_clipboard(self, text: str):
-        pyperclip.copy(text)
-        print("Copied to clipboard:", text)
-
-    def show_snippet_dialog(self, snippet: str, pdf_name: str):
-        dlg = SnippetDialog(snippet, pdf_name, parent=self)
-        dlg.exec_()
-
-    def open_pdf(self, pdf_filename: str):
-        pdf_path = os.path.join(self.dm.pdf_files_directory, pdf_filename)
-        if os.path.exists(pdf_path):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(pdf_path))
-        else:
-            print("PDF file not found:", pdf_path)
-
     # ---------- sessions save/load ----------
 
     def save_session(self):
         session_data = {
             "messages": self.messages,
-            "equations": self.displayed_equations,
-            "snippets": self.indexed_snippets,
         }
         timestamp = int(time.time())
         save_path = os.path.join(APP_SESSIONS_PATH, f"session_{timestamp}.json")
@@ -1416,13 +1209,6 @@ window.MathJax = {
             return
 
         self.messages = session_data.get("messages", [])
-        self.displayed_equations = session_data.get("equations", [])
-        self.indexed_snippets = session_data.get("snippets", [])
-
-        self.snippet_cache = {}
-        for s in self.indexed_snippets:
-            key = (s["pdf_name"], s["snippet"])
-            self.snippet_cache[key] = s["id"]
 
         self.html_messages = []
         for m in self.messages:
@@ -1441,7 +1227,6 @@ window.MathJax = {
 
         self.typing_indicator_visible = False
         self.update_html()
-        self.update_right_panel()
         self.set_send_button_pressed(False)
         print(f"Session loaded from {file_path}")
 
